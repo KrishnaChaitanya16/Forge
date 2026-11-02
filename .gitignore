@@ -1,0 +1,37 @@
+# Binaries
+bin/
+*.exe
+*.out
+
+# Go
+*.test
+*.prof
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment / secrets — never commit these
+.env
+*.env
+secrets/
+*-secret.yaml
+*-credentials.yaml
+
+# Helm generated
+charts/*/charts/
+charts/*/Chart.lock
+
+# Kubernetes generated
+kubeconfig
+*.kubeconfig
+
+# Build artifacts
+dist/
+tmp/
+
+# macOS
+.DS_Store
