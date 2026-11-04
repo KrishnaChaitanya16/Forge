@@ -194,7 +194,87 @@ For Forge's demo, all environments use the same sample app image — so image st
 
 ---
 
-## 7. Summary — what Forge actually saves
+## 7. Container image caching in deep hibernation
+
+This is the most commonly misunderstood part of deep hibernation.
+
+### Where images are stored
+
+Container images live on the **Minikube node's disk** (managed by containerd), completely separate from Kubernetes objects in etcd. When kubelet pulls an image to run a Pod, it stores the image layers here:
+
+```
+Minikube node disk:
+  /var/lib/containerd/snapshots/
+    └── sha256:abc123...    ← image layers stored here
+```
+
+### What happens when deep hibernation deletes the Deployment
+
+```
+Active:           Deployment → Pod running → image IN USE on node
+Warm hibernated:  Deployment (replicas=0) → no Pod → image still on node (referenced by spec)
+Deep hibernated:  Deployment DELETED → image still on node (unreferenced, but not removed)
+```
+
+**Kubernetes never deletes images when objects are deleted.** The image remains on disk after deep hibernation. Only kubelet's garbage collector removes images, and only when node disk usage exceeds 85%.
+
+### The risk: kubelet image garbage collection
+
+If the Minikube node's disk fills up while an environment is deep hibernated, kubelet removes least-recently-used images. That environment's next restore will need a full image pull.
+
+```
+Disk < 80%  →  no GC, image safe
+Disk > 85%  →  GC runs, LRU images removed first
+```
+
+### Three layers of protection Forge uses
+
+**Layer 1: Image digest in CRD status**
+
+```yaml
+status:
+  imageDigest: "sha256:abc123def456..."
+```
+
+Even if the image is GC'd, Forge knows exactly which image to pull back. No tag ambiguity.
+
+**Layer 2: Local registry (most important)**
+
+The local registry on your laptop is NOT on the Minikube node — kubelet GC never touches it. It permanently holds every image ever deployed.
+
+```
+Minikube node               Your laptop
+┌──────────────┐            ┌─────────────────────────┐
+│ containerd   │  ────────▶ │ host.minikube.internal  │
+│ image cache  │   pull     │ :5000 (local registry)  │
+│ (may be GC'd)│            │ permanent copy          │
+└──────────────┘            └─────────────────────────┘
+```
+
+Pull from local registry on a cache miss: **1–3 seconds** vs 30–60 seconds from Docker Hub.
+
+**Layer 3: Minikube image preload (for demo reliability)**
+
+```bash
+minikube image load sample-app:latest
+```
+
+Pre-loaded images bypass GC pressure entirely. Run this before every demo.
+
+### Restoration latency by image state
+
+| Scenario | Image location | Restore time |
+|---|---|---|
+| Warm → Active | Node disk (always cached, Deployment keeps reference) | ~2–3s |
+| Deep → Active (image still on node) | Node disk | ~4–6s |
+| Deep → Active (image GC'd, local registry exists) | Pull from localhost:5000 | ~5–8s |
+| Deep → Active (image GC'd, no local registry) | Pull from Docker Hub | ~35–65s |
+
+**Conclusion:** The local registry is what makes deep hibernation restoration fast and reliable, not node-level image caching. Node caching is a bonus when it works; the local registry is the guarantee.
+
+---
+
+## 8. Summary — what Forge actually saves
 
 | Resource | Saving | When |
 |---|---|---|
