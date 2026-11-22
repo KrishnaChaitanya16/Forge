@@ -179,7 +179,17 @@ type LifecyclePolicy struct {
     TTL string `json:"ttl,omitempty"`
 
     // When true, inactivity-based hibernation is skipped. TTL still applies.
+    // Equivalent to setting Priority = "pinned".
     Pinned bool `json:"pinned,omitempty"`
+
+    // Controls hibernation aggressiveness and eviction order under capacity pressure.
+    // pinned: never auto-hibernate, never evicted.
+    // high: warm after 30m, deep after 4h, last evicted.
+    // normal: warm after 15m, deep after 2h (default).
+    // low: warm after 5m, deep after 30m, first evicted.
+    // +kubebuilder:validation:Enum=pinned;high;normal;low
+    // +kubebuilder:default="normal"
+    Priority string `json:"priority,omitempty"`
 }
 
 type ResourceSpec struct {
@@ -566,8 +576,8 @@ func (m *Manager) evaluateOne(ctx context.Context, env *v1alpha1.Environment) {
         return
     }
 
-    // Skip if pinned
-    if env.Spec.Lifecycle.Pinned {
+    // Skip if pinned (via flag or priority)
+    if env.Spec.Lifecycle.Pinned || env.Spec.Lifecycle.Priority == "pinned" {
         return
     }
 
@@ -581,14 +591,26 @@ func (m *Manager) evaluateOne(ctx context.Context, env *v1alpha1.Environment) {
     }
 
     idle := now.Sub(env.Status.LastActivityAt.Time)
-    deepAfter := parseDuration(env.Spec.Lifecycle.DeepHibernateAfter)
-    warmAfter  := parseDuration(env.Spec.Lifecycle.WarmHibernateAfter)
+    warmAfter, deepAfter := hibernationThresholds(env.Spec.Lifecycle)
 
     switch {
     case idle > deepAfter:
         m.patchState(ctx, env, v1alpha1.StateDeepHibernated, "idle beyond deep-hibernate threshold")
     case idle > warmAfter:
         m.patchState(ctx, env, v1alpha1.StateWarmHibernated, "idle beyond warm-hibernate threshold")
+    }
+}
+
+// hibernationThresholds returns warm and deep thresholds for the environment's priority.
+// Priority overrides explicit spec fields: if priority is set, it sets the timers.
+func hibernationThresholds(lp v1alpha1.LifecyclePolicy) (warm, deep time.Duration) {
+    switch lp.Priority {
+    case "high":
+        return 30 * time.Minute, 4 * time.Hour
+    case "low":
+        return 5 * time.Minute, 30 * time.Minute
+    default: // "normal" or unset — fall back to explicit spec fields
+        return parseDuration(lp.WarmHibernateAfter), parseDuration(lp.DeepHibernateAfter)
     }
 }
 
@@ -879,6 +901,18 @@ func (h *Handler) wakeAndForward(w http.ResponseWriter, r *http.Request, envName
     ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
     defer cancel()
 
+    // Acquire a global restoration slot before attempting wake-up
+    if err := h.capacityWorker.AcquireRestoreSlot(ctx); err != nil {
+        if errors.Is(err, capacity.ErrQueueFull) {
+            w.Header().Set("Retry-After", "10")
+            http.Error(w, "restoration queue full; retry later", http.StatusTooManyRequests)
+            return
+        }
+        http.Error(w, "environment restoration unavailable", http.StatusServiceUnavailable)
+        return
+    }
+    defer h.capacityWorker.ReleaseRestoreSlot()
+
     err := h.wakeLock.Wake(ctx, envName, func(ctx context.Context) error {
         return h.triggerRestore(ctx, envName)
     })
@@ -1082,15 +1116,20 @@ All admission decisions (provision, wake at capacity) go through a single gorout
 
 ```go
 type admitRequest struct {
-    envName string
-    reply   chan error
+    envName  string
+    priority string // "pinned"|"high"|"normal"|"low"
+    reply    chan error
 }
 
 type Worker struct {
-    client       client.Client
-    maxActive    int
-    admitCh      chan admitRequest
-    releaseCh    chan string  // env name released (hibernated or terminated)
+    client                client.Client
+    maxActive             int
+    maxConcurrentRestores int // default 3
+    maxPendingRestores    int // default 5
+    admitCh               chan admitRequest
+    releaseCh             chan string  // env name released (hibernated or terminated)
+    restoreSem            chan struct{} // counting semaphore for concurrent restorations
+    restoreQueue          []admitRequest
 }
 
 func (w *Worker) Run(ctx context.Context) {
@@ -1099,7 +1138,7 @@ func (w *Worker) Run(ctx context.Context) {
         case <-ctx.Done():
             return
         case req := <-w.admitCh:
-            req.reply <- w.admitOne(ctx, req.envName)
+            req.reply <- w.admitOne(ctx, req.envName, req.priority)
         case name := <-w.releaseCh:
             _ = name // capacity freed — drain the pending queue
             w.drainQueue(ctx)
@@ -1107,7 +1146,7 @@ func (w *Worker) Run(ctx context.Context) {
     }
 }
 
-func (w *Worker) admitOne(ctx context.Context, envName string) error {
+func (w *Worker) admitOne(ctx context.Context, envName, priority string) error {
     active, err := w.countActive(ctx)
     if err != nil {
         return err
@@ -1115,18 +1154,57 @@ func (w *Worker) admitOne(ctx context.Context, envName string) error {
     if active < w.maxActive {
         return nil // slot available
     }
-    // Try to evict LRU active environment
-    if err := w.evictLRU(ctx); err != nil {
+    // Try to evict lowest-priority LRU active environment
+    if err := w.evictLRUByPriority(ctx); err != nil {
         return fmt.Errorf("at capacity (%d active); no evictable environment: %w", w.maxActive, err)
     }
     return nil
 }
 
+// evictLRUByPriority finds the least-recently-used environment at the lowest
+// priority level (low before normal before high; pinned is never evicted).
+func (w *Worker) evictLRUByPriority(ctx context.Context) error {
+    list := &v1alpha1.EnvironmentList{}
+    if err := w.client.List(ctx, list); err != nil {
+        return err
+    }
+    priorityOrder := map[string]int{"low": 0, "normal": 1, "high": 2, "pinned": 3}
+    var candidate *v1alpha1.Environment
+    for i := range list.Items {
+        env := &list.Items[i]
+        if env.Status.LifecycleState != v1alpha1.StateActive {
+            continue
+        }
+        if env.Spec.Lifecycle.Pinned || env.Spec.Lifecycle.Priority == "pinned" {
+            continue
+        }
+        if candidate == nil {
+            candidate = env
+            continue
+        }
+        cp := priorityOrder[candidate.Spec.Lifecycle.Priority]
+        ep := priorityOrder[env.Spec.Lifecycle.Priority]
+        if ep < cp {
+            candidate = env // lower priority wins
+        } else if ep == cp {
+            // same priority: pick LRU
+            if env.Status.LastActivityAt != nil && candidate.Status.LastActivityAt != nil &&
+                env.Status.LastActivityAt.Before(candidate.Status.LastActivityAt) {
+                candidate = env
+            }
+        }
+    }
+    if candidate == nil {
+        return fmt.Errorf("all active environments are pinned")
+    }
+    return w.patchState(ctx, candidate, v1alpha1.StateWarmHibernated, "evicted under capacity pressure")
+}
+
 // Admit is called by the reconciler (blocks until a slot is available or ctx expires)
-func (w *Worker) Admit(ctx context.Context, envName string) error {
+func (w *Worker) Admit(ctx context.Context, envName, priority string) error {
     reply := make(chan error, 1)
     select {
-    case w.admitCh <- admitRequest{envName: envName, reply: reply}:
+    case w.admitCh <- admitRequest{envName: envName, priority: priority, reply: reply}:
     case <-ctx.Done():
         return ctx.Err()
     }
@@ -1138,6 +1216,45 @@ func (w *Worker) Admit(ctx context.Context, envName string) error {
     }
 }
 ```
+
+### Bounded restoration queue
+
+Restorations are further bounded by a counting semaphore so that at most `maxConcurrentRestores` environments restore simultaneously on the node. The gateway calls `AcquireRestoreSlot` before triggering a restore; the semaphore is released when the restore completes or times out.
+
+```go
+// AcquireRestoreSlot acquires a concurrent restoration slot.
+// Returns ErrQueueFull if the pending queue is also exhausted.
+func (w *Worker) AcquireRestoreSlot(ctx context.Context) error {
+    select {
+    case w.restoreSem <- struct{}{}: // non-blocking fast path: slot free
+        metrics.RestoreQueueDepth.Set(float64(len(w.restoreQueue)))
+        return nil
+    default:
+    }
+    // Semaphore full — try the pending queue
+    if len(w.restoreQueue) >= w.maxPendingRestores {
+        metrics.RestoreQueueFullTotal.Inc()
+        return ErrQueueFull
+    }
+    // Block until a slot is available or ctx expires
+    select {
+    case w.restoreSem <- struct{}{}:
+        return nil
+    case <-ctx.Done():
+        return ctx.Err()
+    }
+}
+
+// ReleaseRestoreSlot is deferred by the gateway after each restore attempt.
+func (w *Worker) ReleaseRestoreSlot() {
+    <-w.restoreSem
+    metrics.RestoreQueueDepth.Set(float64(len(w.restoreQueue)))
+}
+
+var ErrQueueFull = fmt.Errorf("restoration queue full; retry later")
+```
+
+The gateway's `wakeAndForward` calls `AcquireRestoreSlot` before entering the `WakeLock.Wake` block and `ReleaseRestoreSlot` in a `defer` after the wake completes. When `ErrQueueFull` is returned, the gateway responds with `429 Too Many Requests` and `Retry-After: 10`.
 
 ---
 
@@ -1205,6 +1322,8 @@ gateway:
   port: 8080
   wakeTimeoutSeconds: 60
   gracePeriodMinutes: 5
+  maxConcurrentRestorations: 3
+  maxPendingRestorations: 5
 
 api:
   image:

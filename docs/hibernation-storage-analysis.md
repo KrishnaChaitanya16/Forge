@@ -114,11 +114,11 @@ Using these baseline numbers per environment:
 
 | Open PRs | Running Pods | CPU Reserved | RAM Reserved | etcd storage |
 |---|---|---|---|---|
-| 10 | 10 | 5 cores | 2.5 GB | 310 KB |
-| 25 | 25 | 12.5 cores | 6.25 GB | 775 KB |
-| 50 | 50 | 25 cores | 12.5 GB | 1.55 MB |
-| 100 | 100 | **50 cores** | **25 GB** | 3.1 MB |
-| 500 | 500 | **250 cores** | **125 GB** | 15.5 MB |
+| 10 | 10 | 5 cores | 2.5 GiB | 310 KB |
+| 25 | 25 | 12.5 cores | 6.25 GiB | 775 KB |
+| 50 | 50 | 25 cores | 12.5 GiB | 1.55 MB |
+| 100 | 100 | **50 cores** | **25 GiB** | 3.1 MB |
+| 500 | 500 | **250 cores** | **125 GiB** | 15.5 MB |
 
 At 100 PRs you need a 50-core cluster just for preview environments. At 500 PRs it's a 250-core cluster. This is why companies either spend enormous money on cloud infrastructure or stop giving developers preview environments.
 
@@ -126,16 +126,16 @@ At 100 PRs you need a 50-core cluster just for preview environments. At 500 PRs 
 
 | Open PRs | Active | Hibernated | Running Pods | CPU Reserved | RAM Reserved | etcd storage |
 |---|---|---|---|---|---|---|
-| 10 | 10 | 0 | 10 | 5 cores | 2.5 GB | 310 KB |
-| 25 | 10 | 15 | 10 | 5 cores | 2.5 GB | 550 KB |
-| 50 | 10 | 40 | 10 | 5 cores | 2.5 GB | 950 KB |
-| 100 | 10 | 90 | 10 | **5 cores** | **2.5 GB** | 1.75 MB |
-| 500 | 10 | 490 | 10 | **5 cores** | **2.5 GB** | 8.14 MB |
+| 10 | 10 | 0 | 10 | 5 cores | 2.5 GiB | 310 KB |
+| 25 | 10 | 15 | 10 | 5 cores | 2.5 GiB | 550 KB |
+| 50 | 10 | 40 | 10 | 5 cores | 2.5 GiB | 950 KB |
+| 100 | 10 | 90 | 10 | **5 cores** | **2.5 GiB** | 1.75 MB |
+| 500 | 10 | 490 | 10 | **5 cores** | **2.5 GiB** | 8.14 MB |
 
-**At 100 PRs: Forge uses 5 cores instead of 50. That is a 10× reduction.**
-**At 500 PRs: Forge uses 5 cores instead of 250. That is a 50× reduction.**
+**At 100 PRs: Forge uses 5 cores of application Pod requests instead of 50. That is a 10× reduction.**
+**At 500 PRs: Forge uses 5 cores of application Pod requests instead of 250. That is a 50× reduction.**
 
-The cluster size stays constant regardless of how many PRs are open. Only the etcd storage grows — and it grows slowly (a few MB even at 500 environments).
+Forge bounds active application workload through its admission and hibernation policy — the number of running application Pods stays constant regardless of how many PRs are open. Metadata, etcd objects, and control-plane overhead still grow linearly with environment count, but only the etcd storage grows noticeably, and it grows slowly (a few MB even at 500 environments).
 
 ---
 
@@ -278,15 +278,15 @@ Pre-loaded images bypass GC pressure entirely. Run this before every demo.
 
 | Resource | Saving | When |
 |---|---|---|
-| CPU requests | 100% of idle app workload | From the moment an environment enters warm hibernation |
-| Memory requests | 100% of idle app workload | From the moment an environment enters warm hibernation |
+| CPU requests | All application Pod requests freed | From the moment an environment enters warm hibernation |
+| Memory requests | All application Pod requests freed | From the moment an environment enters warm hibernation |
 | etcd object count | ~50% reduction | Deep hibernation only |
 | Node controller overhead | Reduced at scale | Deep hibernation only |
 | Image download on restore | ~95% (cache hit) | Throughout lifetime via local registry |
 
 **The headline claim for your report:**
 
-> *"Forge reduces preview environment CPU and memory consumption by 100% for idle environments through scale-to-zero hibernation, allowing a fixed 4-core cluster to support 100+ concurrent preview environments where a traditional always-on approach would require 50+ cores."*
+> *"Forge eliminates application Pod CPU and memory requests for hibernated environments through scale-to-zero hibernation, allowing a cluster with 5 cores allocated to preview workloads to support 100+ concurrently registered environments where a traditional always-on approach would require 50+ cores for the same PR count."*
 
 ---
 

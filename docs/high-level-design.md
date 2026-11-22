@@ -158,6 +158,23 @@ Manually pinned                 →  Skip inactivity check
 Restored < 5 min ago            →  Grace period: skip inactivity check
 ```
 
+### Adaptive hibernation policy
+
+Rather than applying identical timers to all environments, Forge uses a rule-based priority system to decide how quickly environments hibernate and which ones are evicted first under capacity pressure.
+
+| Priority | Warm after (idle) | Deep after (idle) | Eviction order |
+|---|---|---|---|
+| `pinned` | Never | Never | Never evicted automatically |
+| `high` | 30 min | 4 h | Last evicted under pressure |
+| `normal` | 15 min | 2 h | Middle |
+| `low` | 5 min | 30 min | First evicted under pressure |
+
+Priority is set per environment via `spec.lifecycle.priority`. The default is `normal`.
+
+**Capacity pressure eviction:** When a new environment (or a restore request) needs a slot and all active slots are full, the capacity worker picks the lowest-priority, least-recently-used active environment to hibernate first. A `pinned` environment is never evicted. If all active environments are `pinned`, the wake request returns `503 Capacity Limit Reached`.
+
+**What this enables:** Teams can mark critical review environments `high` to protect them from automatic eviction while bot-triggered or low-importance preview environments are tagged `low` and yield their slots immediately when anything higher-priority needs them. This costs nothing — it is purely policy in the lifecycle manager, no new infrastructure.
+
 ### 3.5 Forge Gateway
 
 **Responsibility:** Shared reverse proxy that routes traffic to all environments, detects hibernation, and triggers wake-up.
@@ -184,9 +201,37 @@ Restored < 5 min ago            →  Grace period: skip inactivity check
 - Uses native Kubernetes `ResourceQuota` and `LimitRange` per namespace — no custom scheduler
 - Global limit: maximum 10 active environments (configurable)
 - When at capacity for a **new provision**: hibernate the least-recently-used active environment first, then provision the new one
-- **When a hibernated environment is woken and all 10 slots are already active:** evict the LRU active environment to warm hibernation to free a slot. If no eviction candidate exists (all 10 are pinned), the wake request returns `503 Capacity Limit Reached` with a message naming the constraint.
+- **When a hibernated environment is woken and all 10 slots are already active:** evict the lowest-priority, least-recently-used active environment to warm hibernation to free a slot. If no eviction candidate exists (all 10 are `pinned`), the wake request returns `503 Capacity Limit Reached` with a message naming the constraint.
 - **Capacity check is serialized:** a single goroutine (capacity worker) owns all admission decisions. Without this, two simultaneous creates can both pass the cap check before either increments the counter, resulting in 11 active environments. The capacity worker processes one admission at a time.
 - Simple FIFO queue for pending provisioning requests
+
+### Bounded restoration queue
+
+Concurrent restoration requests across different environments are bounded globally, not just deduplicated per environment.
+
+```
+Incoming restoration requests
+            |
+            v
+    Restoration semaphore (max 3 concurrent)
+            |
+      Slot available?
+         /       \
+       Yes        No
+       |           |
+   Restore      Bounded queue (max 5 pending)
+       |           |
+       v         Full?
+    Active       /   \
+              Yes     No
+               |       |
+           429 TooMany  Wait → Restore
+```
+
+- **Max concurrent restorations** (default 3): prevents 10 simultaneous deep hibernation restores from saturating the node's image-pull bandwidth and memory on a laptop cluster.
+- **Max pending queue** (default 5): when both concurrent slots and queue are full, the gateway returns `429 Too Many Requests` with a `Retry-After: 10` header. This provides backpressure rather than accumulating unbounded requests in memory.
+- **High-priority environments** skip the queue and are granted a slot immediately if any active non-`pinned` environment can be evicted to make room.
+- Both limits are configurable via Helm (`gateway.maxConcurrentRestorations`, `gateway.maxPendingRestorations`).
 
 ---
 
@@ -438,7 +483,9 @@ default:
 **Global limits:**
 - Maximum 10 active environments (configurable)
 - Maximum 3 environments per developer
-- New environments queue if at capacity; eligible idle ones are hibernated first
+- New environments queue if at capacity; eligible idle ones are hibernated first (lowest priority, LRU)
+- Maximum 3 concurrent restorations (configurable)
+- Maximum 5 pending restoration requests before 429 is returned
 
 ### Image Scanning (Trivy)
 
@@ -458,8 +505,10 @@ All images are scanned in CI before deployment. HIGH and CRITICAL CVEs block the
 | `forge_hibernations_total` | Counter | Total hibernation events by type (warm/deep) — counter, so `_total` is correct |
 | `forge_terminations_total` | Counter | Total termination events — counter |
 | `forge_active_pods` | Gauge | Running app Pods across all environments — gauge, no `_total` suffix |
-| `forge_cpu_requests_saved_millicores` | Gauge | CPU requests reclaimed by hibernated environments |
-| `forge_memory_requests_saved_bytes` | Gauge | Memory requests reclaimed by hibernated environments |
+| `forge_cpu_requests_saved_millicores` | Gauge | Application Pod CPU requests reclaimed by hibernated environments |
+| `forge_memory_requests_saved_bytes` | Gauge | Application Pod memory requests reclaimed by hibernated environments |
+| `forge_restoration_queue_depth` | Gauge | Pending restoration requests waiting for a concurrent slot |
+| `forge_restoration_queue_full_total` | Counter | Restoration requests rejected because the queue was full (429) |
 
 > **Prometheus naming convention:** `_total` suffix is reserved for Counters (monotonically increasing). Gauges use no suffix. Mixing them confuses Prometheus tooling and rate() queries.
 
