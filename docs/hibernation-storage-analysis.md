@@ -41,7 +41,7 @@ Kubernetes objects in etcd:
   Total etcd:                    ~31KB
 
 Node resources consumed:
-  ✓ CPU request:                 500m (0.5 cores)
+  ✓ CPU request:                 200m (0.2 cores)
   ✓ Memory request:              256Mi
   ✓ Container image on disk:     ~100MB (one-time, shared across restores)
 
@@ -105,8 +105,8 @@ Running processes:
 
 ## 3. The numbers at scale — where the real savings appear
 
-Using these baseline numbers per environment:
-- CPU request: **500m** (0.5 cores)
+Using these baseline numbers per environment (consistent with LLD CRD defaults and ResourceQuota):
+- CPU request: **200m** (0.2 cores)
 - Memory request: **256Mi**
 - etcd storage: **~31KB** active, **~16KB** deep hibernated
 
@@ -114,26 +114,26 @@ Using these baseline numbers per environment:
 
 | Open PRs | Running Pods | CPU Reserved | RAM Reserved | etcd storage |
 |---|---|---|---|---|
-| 10 | 10 | 5 cores | 2.5 GiB | 310 KB |
-| 25 | 25 | 12.5 cores | 6.25 GiB | 775 KB |
-| 50 | 50 | 25 cores | 12.5 GiB | 1.55 MB |
-| 100 | 100 | **50 cores** | **25 GiB** | 3.1 MB |
-| 500 | 500 | **250 cores** | **125 GiB** | 15.5 MB |
+| 10 | 10 | 2 cores | 2.5 GiB | 310 KB |
+| 25 | 25 | 5 cores | 6.25 GiB | 775 KB |
+| 50 | 50 | 10 cores | 12.5 GiB | 1.55 MB |
+| 100 | 100 | **20 cores** | **25 GiB** | 3.1 MB |
+| 500 | 500 | **100 cores** | **125 GiB** | 15.5 MB |
 
-At 100 PRs you need a 50-core cluster just for preview environments. At 500 PRs it's a 250-core cluster. This is why companies either spend enormous money on cloud infrastructure or stop giving developers preview environments.
+At 100 PRs you need 20 CPU cores reserved just for preview environments. At 500 PRs it's 100 cores. This is why companies either spend enormous money on cloud infrastructure or stop giving developers preview environments.
 
 ### With Forge (max 10 active, rest deep hibernated)
 
 | Open PRs | Active | Hibernated | Running Pods | CPU Reserved | RAM Reserved | etcd storage |
 |---|---|---|---|---|---|---|
-| 10 | 10 | 0 | 10 | 5 cores | 2.5 GiB | 310 KB |
-| 25 | 10 | 15 | 10 | 5 cores | 2.5 GiB | 550 KB |
-| 50 | 10 | 40 | 10 | 5 cores | 2.5 GiB | 950 KB |
-| 100 | 10 | 90 | 10 | **5 cores** | **2.5 GiB** | 1.75 MB |
-| 500 | 10 | 490 | 10 | **5 cores** | **2.5 GiB** | 8.14 MB |
+| 10 | 10 | 0 | 10 | 2 cores | 2.5 GiB | 310 KB |
+| 25 | 10 | 15 | 10 | 2 cores | 2.5 GiB | 550 KB |
+| 50 | 10 | 40 | 10 | 2 cores | 2.5 GiB | 950 KB |
+| 100 | 10 | 90 | 10 | **2 cores** | **2.5 GiB** | 1.75 MB |
+| 500 | 10 | 490 | 10 | **2 cores** | **2.5 GiB** | 8.14 MB |
 
-**At 100 PRs: Forge uses 5 cores of application Pod requests instead of 50. That is a 10× reduction.**
-**At 500 PRs: Forge uses 5 cores of application Pod requests instead of 250. That is a 50× reduction.**
+**At 100 PRs: Forge uses 2 cores of application Pod requests instead of 20. That is a 10× reduction.**
+**At 500 PRs: Forge uses 2 cores of application Pod requests instead of 100. That is a 50× reduction.**
 
 Forge bounds active application workload through its admission and hibernation policy — the number of running application Pods stays constant regardless of how many PRs are open. Metadata, etcd objects, and control-plane overhead still grow linearly with environment count, but only the etcd storage grows noticeably, and it grows slowly (a few MB even at 500 environments).
 
@@ -160,7 +160,7 @@ The CPU and memory saving is **identical** between warm and deep. Both have zero
 
 | | Warm | Deep |
 |---|---|---|
-| CPU saved | 500m | 500m |
+| CPU saved | 200m | 200m |
 | Memory saved | 256Mi | 256Mi |
 | etcd objects removed | 1 (Pod) | 6 (Pod, Deployment, ReplicaSet, Service, Ingress + Pod) |
 | etcd space saved vs active | ~4KB | ~15KB |
@@ -240,7 +240,7 @@ Even if the image is GC'd, Forge knows exactly which image to pull back. No tag 
 
 **Layer 2: Local registry (most important)**
 
-The local registry on your laptop is NOT on the Minikube node — kubelet GC never touches it. It permanently holds every image ever deployed.
+The local registry on your laptop is NOT on the Minikube node — kubelet GC never touches it. With a named Docker volume (`-v registry-data:/var/lib/registry`) it survives container restarts. Without that volume the registry loses its data if the container is removed. Define a cleanup policy (e.g., delete images for closed PRs) so the registry does not accumulate images indefinitely.
 
 ```
 Minikube node               Your laptop
@@ -256,6 +256,10 @@ Pull from local registry on a cache miss: **1–3 seconds** vs 30–60 seconds f
 **Layer 3: Minikube image preload (for demo reliability)**
 
 ```bash
+# Start registry with persistent storage (data survives restarts)
+docker run -d --restart unless-stopped -p 5000:5000 \
+  -v registry-data:/var/lib/registry --name registry registry:2
+
 minikube image load sample-app:latest
 ```
 
@@ -286,7 +290,7 @@ Pre-loaded images bypass GC pressure entirely. Run this before every demo.
 
 **The headline claim for your report:**
 
-> *"Forge eliminates application Pod CPU and memory requests for hibernated environments through scale-to-zero hibernation, allowing a cluster with 5 cores allocated to preview workloads to support 100+ concurrently registered environments where a traditional always-on approach would require 50+ cores for the same PR count."*
+> *"Forge eliminates application Pod CPU and memory requests for hibernated environments through scale-to-zero hibernation, allowing a cluster with 2 cores allocated to preview workloads (10 active × 200m each) to support 100+ concurrently registered environments where a traditional always-on approach would require 20 cores for the same PR count — a 10× reduction in reserved CPU."*
 
 ---
 

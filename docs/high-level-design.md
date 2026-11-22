@@ -352,7 +352,28 @@ This pipeline serves two purposes: (1) building and deploying Forge itself, and 
 
 **Ansible role:** Ansible playbooks handle machine setup — installing Minikube, kubectl, Helm, Docker, and the local registry. This is the config management layer. The Helm chart is the K8s deployment layer. Both are required by the rubric.
 
-**Helm and CRDs:** CRD manifests placed under `charts/forge/crds/` are installed by `helm install` but **not upgraded by `helm upgrade`**. Document a manual step: `kubectl apply -f charts/forge/crds/` must be run before `helm upgrade` when the CRD schema changes. Alternatively use a pre-upgrade hook or a separate `forge-crds` chart.
+**Helm and CRDs:** CRD manifests placed under `charts/forge/crds/` are installed by `helm install` but **not upgraded by `helm upgrade`**. The `deploy` pipeline stage always runs `kubectl apply -f config/crd/` before `helm upgrade` to ensure the API server has the latest schema before the new operator version starts. A schema mismatch between operator and CRD will cause immediate reconciliation failures. After CRD apply and before operator rollout, the pipeline verifies the CRD version matches what the new operator image expects (checked via a `forge-crd-check` init container or a simple `kubectl get crd` version label check).
+
+**Pipeline stages (8 total):**
+1. Lint + vet
+2. Test (envtest, go test -race)
+3. Build Docker images (operator, gateway, API, webhook)
+4. Trivy scan — all 4 images; fail on HIGH/CRITICAL
+5. Push to local registry (tagged with Git SHA — never `latest`)
+6. Apply CRDs (`kubectl apply -f config/crd/`)
+7. Helm deploy (`helm upgrade --install forge ...`)
+8. Rollout verify — all 4 components + post-deploy smoke test
+
+**Rollout verification (stage 8):**
+```bash
+kubectl rollout status deployment/forge-operator  -n forge-system --timeout=120s
+kubectl rollout status deployment/forge-gateway   -n forge-system --timeout=120s
+kubectl rollout status deployment/forge-api       -n forge-system --timeout=120s
+kubectl rollout status deployment/forge-webhook   -n forge-system --timeout=120s
+# Smoke test: create a test environment, wait for ACTIVE, then delete it
+./hack/smoke-test.sh
+```
+If any rollout times out or the smoke test fails, the pipeline stage fails and the previous release remains active.
 
 ---
 
@@ -467,6 +488,8 @@ The REST API and webhook receiver are reachable from outside the cluster (via Mi
 
 ```yaml
 # Per-environment ResourceQuota (in each namespace)
+# Requests match the LLD CRD defaults (200m CPU / 256Mi memory) so a single
+# default pod fits within the quota without violating it.
 hard:
   requests.cpu: "200m"
   requests.memory: "256Mi"
@@ -474,10 +497,13 @@ hard:
   limits.memory: "512Mi"
   pods: "5"
 
-# LimitRange (default limits for pods that don't specify)
-default:
+# LimitRange — applies to pods that don't specify requests/limits explicitly
+defaultRequest:
   cpu: "200m"
   memory: "256Mi"
+default:
+  cpu: "500m"
+  memory: "512Mi"
 ```
 
 **Global limits:**
@@ -497,32 +523,45 @@ All images are scanned in CI before deployment. HIGH and CRITICAL CVEs block the
 
 ### Prometheus Metrics (custom, exposed by Forge)
 
-| Metric | Type | Description |
-|---|---|---|
-| `forge_environments` | Gauge | Total environments by state label (active/warm/deep/restoring) — gauge, so no `_total` suffix |
-| `forge_provisioning_duration_seconds` | Histogram | Time from API request to ACTIVE state |
-| `forge_restoration_duration_seconds` | Histogram | Time from wake request to first successful response |
-| `forge_hibernations_total` | Counter | Total hibernation events by type (warm/deep) — counter, so `_total` is correct |
-| `forge_terminations_total` | Counter | Total termination events — counter |
-| `forge_active_pods` | Gauge | Running app Pods across all environments — gauge, no `_total` suffix |
-| `forge_cpu_requests_saved_millicores` | Gauge | Application Pod CPU requests reclaimed by hibernated environments |
-| `forge_memory_requests_saved_bytes` | Gauge | Application Pod memory requests reclaimed by hibernated environments |
-| `forge_restoration_queue_depth` | Gauge | Pending restoration requests waiting for a concurrent slot |
-| `forge_restoration_queue_full_total` | Counter | Restoration requests rejected because the queue was full (429) |
+> **Prometheus naming:** `_total` suffix is for Counters only. Gauges have no suffix.
+> **Cardinality:** Never use PR number or environment name as a metric label — that creates one time series per PR and will make Prometheus slow. Use bounded labels only: `state`, `result`, `type`, `reason`.
 
-> **Prometheus naming convention:** `_total` suffix is reserved for Counters (monotonically increasing). Gauges use no suffix. Mixing them confuses Prometheus tooling and rate() queries.
+| Metric | Type | Labels | Notes |
+|---|---|---|---|
+| `forge_environments` | Gauge | `state` | Count of environments per state. Read from CRD list, not inside reconcile. |
+| `forge_provisioning_duration_seconds` | Histogram | `result` | Time from acceptance to ACTIVE. |
+| `forge_provisioning_failures_total` | Counter | `reason` (timeout/image_pull/quota/other) | Incremented **only on the actual transition** to PROVISIONING_FAILED. |
+| `forge_restoration_duration_seconds` | Histogram | `from` (warm/deep), `result` | Measured from `RestorationStartedAt` to ACTIVE. Report p50/p95/p99 in Grafana. |
+| `forge_restoration_failures_total` | Counter | `reason` | Incremented only on the actual transition to RESTORATION_FAILED. |
+| `forge_hibernations_total` | Counter | `type` (warm/deep) | Incremented only when the state transition actually occurs, not on every reconcile. |
+| `forge_terminations_total` | Counter | `reason` (ttl/pr_closed/manual) | — |
+| `forge_environment_evictions_total` | Counter | `evicted_priority` | LRU evictions under capacity pressure. |
+| `forge_active_pods` | Gauge | — | Ready Pods only (not just Running). |
+| `forge_environment_ready` | Gauge | — | Environments in ACTIVE with all Pods ready. |
+| `forge_cpu_requests_saved_millicores` | Gauge | — | Sum of `spec.resources.cpuRequest` for hibernated environments. From CRD specs, not node metrics. |
+| `forge_memory_requests_saved_bytes` | Gauge | — | Same approach for memory. |
+| `forge_restoration_queue_depth` | Gauge | — | Pending restoration requests. |
+| `forge_restoration_queue_full_total` | Counter | — | 429s returned due to full queue. |
+| `forge_restoration_queue_wait_seconds` | Histogram | — | Time waiting for a restoration slot. |
+| `forge_image_pull_duration_seconds` | Histogram | `result` | Time for image pull during restoration. |
+| `forge_gateway_requests_total` | Counter | `state` (active/hibernated/unknown) | All inbound gateway requests. |
+| `forge_gateway_upstream_errors_total` | Counter | `reason` | Errors forwarding to live environments. |
+| `forge_orphaned_resources` | Gauge | `kind` | K8s objects with Forge labels but no matching Environment CRD. |
 
 ### Grafana Dashboards
 
 **Dashboard 1: Environment Lifecycle**
 - Current environments by state (pie chart)
-- Provisioning duration over time
-- Restoration latency (warm vs deep) — key benchmark
+- Provisioning duration over time (p50/p95/p99)
+- Restoration latency by hibernation type (warm vs deep) — p50/p95/p99 — key benchmark
+- Provisioning and restoration failure counts by reason
+- Eviction count over time
 
 **Dashboard 2: Resource Efficiency**
-- Active Pod count over time
-- CPU/memory requests before vs after hibernation — demonstrates Forge's core value
+- Ready Pod count over time (not just running)
+- CPU/memory requests reclaimed by hibernated environments (from CRD specs)
 - Environments created/terminated per hour
+- Restoration queue depth and wait time
 
 **Dashboard 3: Pipeline Health** (for SPE demo)
 - Pipeline run duration

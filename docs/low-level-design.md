@@ -137,104 +137,137 @@ type Environment struct {
 }
 
 type EnvironmentSpec struct {
-    // +kubebuilder:validation:MaxLength=63
+    // Sanitised repo slug, e.g. "payments" for "team-a/payments". Combined with
+    // PullRequest to form a globally-unique environment name: payments-pr-101.
+    // +kubebuilder:validation:MaxLength=52
     // +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*[a-z0-9]$`
     Repository string `json:"repository"`
 
     // +kubebuilder:validation:Minimum=1
     PullRequest int `json:"pullRequest"`
 
+    // GitHub login of the developer who opened the PR. Used to enforce the
+    // per-developer active-environment quota.
+    // +kubebuilder:validation:MaxLength=39
+    Owner string `json:"owner"`
+
     Image     ImageSpec       `json:"image"`
     Resources ResourceSpec    `json:"resources,omitempty"`
     Lifecycle LifecyclePolicy `json:"lifecycle,omitempty"`
+    // MVP: stateless only. Persistent is reserved for future use.
     Storage   StorageSpec     `json:"storage,omitempty"`
 }
 
 type ImageSpec struct {
-    // e.g. "payments-service"
+    // Registry/repository path without tag, e.g. "payments-service".
+    // +kubebuilder:validation:MaxLength=255
     Repository string `json:"repository"`
-    // e.g. "pr-101"
+    // Mutable tag pointing to the desired image for this PR, e.g. "pr-101-abc123".
     Tag string `json:"tag"`
-    // Populated by operator after first successful pull. sha256:...
-    // +kubebuilder:validation:Pattern=`^sha256:[a-f0-9]{64}$`
-    Digest string `json:"digest,omitempty"`
+    // Port the application container listens on. Required for Service and readiness probe.
+    // +kubebuilder:validation:Minimum=1
+    // +kubebuilder:validation:Maximum=65535
+    // +kubebuilder:default=8080
+    Port int32 `json:"port,omitempty"`
 }
 
 type LifecyclePolicy struct {
-    // Duration string: "15m", "1h", etc.
-    // +kubebuilder:validation:Pattern=`^[0-9]+(m|h)$`
-    // +kubebuilder:default="15m"
-    InactivityTimeout string `json:"inactivityTimeout,omitempty"`
-
+    // WarmHibernateAfter: duration of inactivity before warm hibernation.
     // +kubebuilder:validation:Pattern=`^[0-9]+(m|h)$`
     // +kubebuilder:default="15m"
     WarmHibernateAfter string `json:"warmHibernateAfter,omitempty"`
 
+    // DeepHibernateAfter: duration of inactivity before deep hibernation.
     // +kubebuilder:validation:Pattern=`^[0-9]+(m|h)$`
     // +kubebuilder:default="2h"
     DeepHibernateAfter string `json:"deepHibernateAfter,omitempty"`
 
-    // +kubebuilder:validation:Pattern=`^[0-9]+(h|d)$`
+    // TTL: maximum environment lifetime from acceptance.
+    // Go duration string; "d" is not supported — use "h" (e.g. "72h").
+    // +kubebuilder:validation:Pattern=`^[0-9]+h$`
     // +kubebuilder:default="72h"
     TTL string `json:"ttl,omitempty"`
 
-    // When true, inactivity-based hibernation is skipped. TTL still applies.
-    // Equivalent to setting Priority = "pinned".
-    Pinned bool `json:"pinned,omitempty"`
-
-    // Controls hibernation aggressiveness and eviction order under capacity pressure.
-    // pinned: never auto-hibernate, never evicted.
-    // high: warm after 30m, deep after 4h, last evicted.
-    // normal: warm after 15m, deep after 2h (default).
-    // low: warm after 5m, deep after 30m, first evicted.
+    // Priority controls hibernation thresholds and eviction order.
+    // pinned: no auto-hibernate, never evicted. TTL still terminates it.
+    // high:   warm after 30m, deep after 4h, last evicted under pressure.
+    // normal: uses WarmHibernateAfter / DeepHibernateAfter values (default).
+    // low:    warm after 5m, deep after 30m, first evicted under pressure.
+    // When Priority != "normal", it overrides WarmHibernateAfter/DeepHibernateAfter.
     // +kubebuilder:validation:Enum=pinned;high;normal;low
     // +kubebuilder:default="normal"
     Priority string `json:"priority,omitempty"`
 }
 
 type ResourceSpec struct {
-    // +kubebuilder:default="100m"
+    // +kubebuilder:validation:Pattern=`^[0-9]+(m|[0-9])$`
+    // +kubebuilder:default="200m"
     CPURequest string `json:"cpuRequest,omitempty"`
+    // +kubebuilder:validation:Pattern=`^[0-9]+(m|[0-9])$`
     // +kubebuilder:default="500m"
     CPULimit string `json:"cpuLimit,omitempty"`
-    // +kubebuilder:default="128Mi"
+    // +kubebuilder:validation:Pattern=`^[0-9]+(Mi|Gi)$`
+    // +kubebuilder:default="256Mi"
     MemoryRequest string `json:"memoryRequest,omitempty"`
+    // +kubebuilder:validation:Pattern=`^[0-9]+(Mi|Gi)$`
     // +kubebuilder:default="512Mi"
     MemoryLimit string `json:"memoryLimit,omitempty"`
+    // +kubebuilder:validation:XValidation:rule="self.cpuRequest <= self.cpuLimit",message="cpuRequest must not exceed cpuLimit"
+    // +kubebuilder:validation:XValidation:rule="self.memoryRequest <= self.memoryLimit",message="memoryRequest must not exceed memoryLimit"
 }
 
 type StorageSpec struct {
-    // If false (default), no PVC is created. App gets ephemeral storage only.
+    // MVP: keep false. PVC creation is not implemented in Phase 1.
     Persistent bool `json:"persistent,omitempty"`
-    // Only used when Persistent = true
     // +kubebuilder:default="1Gi"
     SizeLimit string `json:"sizeLimit,omitempty"`
 }
 
-// EnvironmentStatus is set exclusively by the operator. Never set by external callers.
+// EnvironmentStatus is written exclusively by the operator. The gateway may patch
+// only lastActivityAt. The lifecycle manager may patch only lifecycleState + message.
+// All other fields are owned by the operator controller.
 type EnvironmentStatus struct {
     // +kubebuilder:validation:Enum=PROVISIONING;ACTIVE;WARM_HIBERNATED;DEEP_HIBERNATED;RESTORING;TERMINATING;TERMINATED;PROVISIONING_FAILED;RESTORATION_FAILED
     LifecycleState LifecycleState `json:"lifecycleState,omitempty"`
 
-    // e.g. "pr-101.dev.local"
+    // e.g. "payments-pr-101.dev.local"
     PreviewURL string `json:"previewURL,omitempty"`
 
-    // Name of the managed namespace, e.g. "forge-pr-101"
+    // Name of the managed namespace, e.g. "forge-payments-pr-101"
     NamespaceName string `json:"namespaceName,omitempty"`
 
-    // Last HTTP request timestamp recorded by the gateway
+    // Last HTTP request timestamp. Written by the gateway via a targeted status patch.
+    // The lifecycle manager reads this to decide hibernation. Write debounced — do not
+    // update on every request; update at most once per 10s to limit etcd write rate.
     LastActivityAt *metav1.Time `json:"lastActivityAt,omitempty"`
 
-    // When the environment last finished restoring. Used for grace period.
+    // When provisioning was first accepted. Used to calculate provisioning timeout.
+    // Set at the transition from "" → PROVISIONING and never changed.
+    ProvisioningStartedAt *metav1.Time `json:"provisioningStartedAt,omitempty"`
+
+    // When the current restore attempt began. Used to timeout restores independently
+    // of when RestoredAt was last set. Set every time state enters RESTORING.
+    RestorationStartedAt *metav1.Time `json:"restorationStartedAt,omitempty"`
+
+    // When the environment last successfully restored. Used for the grace period.
     RestoredAt *metav1.Time `json:"restoredAt,omitempty"`
+
+    // How many consecutive restoration attempts have failed. Reset to 0 on success.
+    RestorationAttempts int `json:"restorationAttempts,omitempty"`
+
+    // Human-readable failure reason from the last failed operation.
+    LastFailureReason string `json:"lastFailureReason,omitempty"`
 
     // When the environment first became ACTIVE
     ActiveSince *metav1.Time `json:"activeSince,omitempty"`
 
-    // Absolute expiry time, computed from spec.lifecycle.ttl at creation
+    // Absolute expiry time, computed from spec.lifecycle.ttl at the moment the
+    // Environment is accepted (created), not when it first becomes ready.
     ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
 
-    // Image digest captured after first successful deployment
+    // Immutable image digest of the currently deployed image (sha256:...).
+    // Populated after the first successful Deployment rollout.
+    // Used during restoration to avoid tag ambiguity.
     ImageDigest string `json:"imageDigest,omitempty"`
 
     // Human-readable status message
@@ -354,8 +387,12 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
         return r.reconcileDeepHibernated(ctx, env)
     case v1alpha1.StateRestoring:
         return r.reconcileRestoring(ctx, env)
+    case v1alpha1.StateRestorationFailed:
+        return r.reconcileRestorationFailed(ctx, env)
     case v1alpha1.StateTerminating:
         return r.reconcileTerminating(ctx, env)
+    case v1alpha1.StateProvisioningFailed, v1alpha1.StateTerminated:
+        return ctrl.Result{}, nil // terminal states; no requeue
     default:
         log.Info("unhandled state", "state", env.Status.LifecycleState)
         return ctrl.Result{}, nil
@@ -376,38 +413,65 @@ func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 ```go
 func (r *EnvironmentReconciler) reconcileProvisioning(ctx context.Context, env *v1alpha1.Environment) (ctrl.Result, error) {
+    now := metav1.Now()
+
+    // Record provisioning start time on first entry (never overwrite — used for timeout).
+    if env.Status.ProvisioningStartedAt == nil {
+        // Also compute TTL expiry here, at acceptance, not at readiness.
+        expiresAt := metav1.NewTime(now.Time.Add(parseDuration(env.Spec.Lifecycle.TTL)))
+        env.Status.ProvisioningStartedAt = &now
+        env.Status.ExpiresAt             = &expiresAt
+        env.Status.PreviewURL            = fmt.Sprintf("%s-%s-pr-%d.dev.local",
+            env.Spec.Owner, env.Spec.Repository, env.Spec.PullRequest)
+        if err := r.Status().Update(ctx, env); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
+
+    // Provisioning timeout (image pull hung, scheduler unavailable, etc.)
+    if time.Since(env.Status.ProvisioningStartedAt.Time) > 10*time.Minute {
+        return ctrl.Result{}, r.setFailure(ctx, env, v1alpha1.StateProvisioningFailed,
+            fmt.Errorf("provisioning timed out after 10 minutes"))
+    }
+
     // 1. Check capacity (delegated to capacity worker via channel)
-    if err := r.CapacityWorker.Admit(ctx, env.Name); err != nil {
-        // Queued — requeue when a slot opens
+    if err := r.CapacityWorker.Admit(ctx, env.Name, env.Spec.Lifecycle.Priority); err != nil {
         return ctrl.Result{RequeueAfter: 30 * time.Second}, r.setStatus(ctx, env, v1alpha1.StateProvisioning, "waiting for capacity slot")
     }
 
-    // 2. Create namespace (idempotent)
+    // 2. Create namespace and persist its name to status immediately.
+    // All subsequent provisioner calls rely on env.Status.NamespaceName.
     ns, err := r.Provisioner.EnsureNamespace(ctx, env)
     if err != nil {
         return ctrl.Result{}, r.setFailure(ctx, env, v1alpha1.StateProvisioningFailed, err)
     }
+    if env.Status.NamespaceName != ns.Name {
+        env.Status.NamespaceName = ns.Name
+        if err := r.Status().Update(ctx, env); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
 
     // 3. Apply ResourceQuota + LimitRange + NetworkPolicy (idempotent, parallel)
     g, gctx := errgroup.WithContext(ctx)
-    g.Go(func() error { return r.Provisioner.EnsureResourceQuota(gctx, env, ns) })
-    g.Go(func() error { return r.Provisioner.EnsureNetworkPolicies(gctx, env, ns) })
+    g.Go(func() error { return r.Provisioner.EnsureResourceQuota(gctx, env, ns.Name) })
+    g.Go(func() error { return r.Provisioner.EnsureNetworkPolicies(gctx, env, ns.Name) })
     if err := g.Wait(); err != nil {
         return ctrl.Result{}, r.setFailure(ctx, env, v1alpha1.StateProvisioningFailed, err)
     }
 
-    // 4. Create Deployment
-    if err := r.Provisioner.EnsureDeployment(ctx, env, ns, 1); err != nil {
+    // 4. Create Deployment (uses ns.Name directly — not env.Status.NamespaceName)
+    if err := r.Provisioner.EnsureDeployment(ctx, env, ns.Name, 1); err != nil {
         return ctrl.Result{}, r.setFailure(ctx, env, v1alpha1.StateProvisioningFailed, err)
     }
 
     // 5. Create Service
-    if err := r.Provisioner.EnsureService(ctx, env, ns); err != nil {
+    if err := r.Provisioner.EnsureService(ctx, env, ns.Name); err != nil {
         return ctrl.Result{}, r.setFailure(ctx, env, v1alpha1.StateProvisioningFailed, err)
     }
 
     // 6. Check readiness — requeue if not yet ready
-    ready, err := r.Provisioner.IsDeploymentReady(ctx, env, ns)
+    ready, err := r.Provisioner.IsDeploymentReady(ctx, ns.Name, env.Name)
     if err != nil {
         return ctrl.Result{}, err
     }
@@ -415,14 +479,14 @@ func (r *EnvironmentReconciler) reconcileProvisioning(ctx context.Context, env *
         return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
     }
 
-    // 7. Compute expiry, set ACTIVE
-    expiresAt := metav1.NewTime(time.Now().Add(parseDuration(env.Spec.Lifecycle.TTL)))
-    env.Status.ExpiresAt     = &expiresAt
-    env.Status.PreviewURL    = fmt.Sprintf("%s.dev.local", env.Name)
-    env.Status.NamespaceName = ns.Name
-    now := metav1.Now()
-    env.Status.ActiveSince   = &now
-    env.Status.LastActivityAt = &now
+    // 7. Capture image digest from the running ReplicaSet for future restorations.
+    if digest, err := r.Provisioner.ResolveImageDigest(ctx, ns.Name, env.Name); err == nil && digest != "" {
+        env.Status.ImageDigest = digest
+    }
+
+    nowReady := metav1.Now()
+    env.Status.ActiveSince    = &nowReady
+    env.Status.LastActivityAt = &nowReady
 
     return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateActive, "environment ready")
 }
@@ -461,33 +525,73 @@ func (r *EnvironmentReconciler) reconcileDeepHibernated(ctx context.Context, env
 func (r *EnvironmentReconciler) reconcileRestoring(ctx context.Context, env *v1alpha1.Environment) (ctrl.Result, error) {
     ns := env.Status.NamespaceName
 
+    // Record start time on first entry into RESTORING state.
+    if env.Status.RestorationStartedAt == nil {
+        now := metav1.Now()
+        env.Status.RestorationStartedAt = &now
+        if err := r.Status().Update(ctx, env); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
+
+    // Timeout: use RestorationStartedAt, never RestoredAt (which is nil until success).
+    if time.Since(env.Status.RestorationStartedAt.Time) > 60*time.Second {
+        env.Status.RestorationAttempts++
+        env.Status.LastFailureReason = "readiness probe did not pass within 60s"
+        return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateRestorationFailed,
+            fmt.Sprintf("timed out (attempt %d)", env.Status.RestorationAttempts))
+    }
+
     // Recreate resources in parallel where possible
     g, gctx := errgroup.WithContext(ctx)
-    g.Go(func() error { return r.Provisioner.EnsureDeployment(gctx, env, nil, 1) })
-    g.Go(func() error { return r.Provisioner.EnsureService(gctx, env, nil) })
+    g.Go(func() error { return r.Provisioner.EnsureDeployment(gctx, env, ns, 1) })
+    g.Go(func() error { return r.Provisioner.EnsureService(gctx, env, ns) })
     if err := g.Wait(); err != nil {
         return ctrl.Result{}, err
     }
 
-    // Check readiness — requeue if not yet ready
-    ready, err := r.Provisioner.IsDeploymentReady(ctx, env, nil)
+    // Check readiness
+    ready, err := r.Provisioner.IsDeploymentReady(ctx, ns, env.Name)
     if err != nil {
         return ctrl.Result{}, err
     }
     if !ready {
-        // Check timeout
-        if time.Since(env.Status.RestoredAt.Time) > 60*time.Second {
-            return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateRestorationFailed, "timed out waiting for readiness")
-        }
         return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
     }
 
-    now := metav1.Now()
-    env.Status.RestoredAt    = &now
-    env.Status.LastActivityAt = &now  // reset — prevents immediate re-hibernation
+    // Measure duration before setting RestoredAt
+    duration := time.Since(env.Status.RestorationStartedAt.Time)
 
-    metrics.RecordRestoration(env.Name, time.Since(env.Status.RestoredAt.Time))
+    now := metav1.Now()
+    env.Status.RestoredAt         = &now
+    env.Status.LastActivityAt     = &now  // reset — prevents immediate re-hibernation
+    env.Status.RestorationAttempts = 0
+    env.Status.LastFailureReason  = ""
+    env.Status.RestorationStartedAt = nil // cleared on success
+
+    metrics.RecordRestoration(env.Name, duration)
     return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateActive, "restored")
+}
+```
+
+### Restoration failure handler (`pkg/controller/reconcile_restoring.go`)
+
+```go
+const maxRestorationAttempts = 3
+
+func (r *EnvironmentReconciler) reconcileRestorationFailed(ctx context.Context, env *v1alpha1.Environment) (ctrl.Result, error) {
+    if env.Status.RestorationAttempts >= maxRestorationAttempts {
+        // Permanent failure after maxRestorationAttempts — leave in failed state.
+        // A subsequent incoming HTTP request (via gateway) can reset the state to
+        // RESTORING to trigger a fresh attempt, so this is not permanently stuck.
+        return ctrl.Result{}, nil
+    }
+    // Exponential backoff before retry: 30s, 60s, 120s
+    backoff := time.Duration(env.Status.RestorationAttempts*env.Status.RestorationAttempts) * 30 * time.Second
+    // Reset to RESTORING — the restoration handler will start a new attempt.
+    env.Status.RestorationStartedAt = nil
+    return ctrl.Result{RequeueAfter: backoff}, r.setStatus(ctx, env, v1alpha1.StateRestoring,
+        fmt.Sprintf("retrying restoration (attempt %d/%d)", env.Status.RestorationAttempts+1, maxRestorationAttempts))
 }
 ```
 
@@ -498,9 +602,18 @@ func (r *EnvironmentReconciler) reconcileTerminating(ctx context.Context, env *v
     ns := env.Status.NamespaceName
 
     if ns != "" {
-        // Deleting the namespace cascades to all resources inside it
+        // Request namespace deletion. The namespace deletion is ASYNCHRONOUS —
+        // it may take seconds to minutes to fully terminate.
         if err := r.Provisioner.DeleteNamespace(ctx, ns); client.IgnoreNotFound(err) != nil {
             return ctrl.Result{}, err
+        }
+        // Check if the namespace is still present. If so, requeue and wait.
+        // Only remove the finalizer after the namespace is confirmed gone.
+        nsObj := &corev1.Namespace{}
+        err := r.Get(ctx, types.NamespacedName{Name: ns}, nsObj)
+        if err == nil || !apierrors.IsNotFound(err) {
+            // Namespace still exists (or error reading it) — wait
+            return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
         }
     }
 
@@ -712,9 +825,16 @@ func allowDNSEgressPolicy(nsName string) *networkingv1.NetworkPolicy {
 ### Deployment provisioner (`pkg/provisioner/deployment.go`)
 
 ```go
-func (p *Provisioner) EnsureDeployment(ctx context.Context, env *v1alpha1.Environment, ns *corev1.Namespace, replicas int32) error {
-    nsName := env.Status.NamespaceName
-    image  := fmt.Sprintf("host.minikube.internal:5000/%s:%s", env.Spec.Image.Repository, env.Spec.Image.Tag)
+func (p *Provisioner) EnsureDeployment(ctx context.Context, env *v1alpha1.Environment, nsName string, replicas int32) error {
+    // Use immutable digest when available; fall back to mutable tag only on first deploy.
+    var image string
+    if env.Status.ImageDigest != "" {
+        image = fmt.Sprintf("host.minikube.internal:5000/%s@%s",
+            env.Spec.Image.Repository, env.Status.ImageDigest)
+    } else {
+        image = fmt.Sprintf("host.minikube.internal:5000/%s:%s",
+            env.Spec.Image.Repository, env.Spec.Image.Tag)
+    }
 
     dep := &appsv1.Deployment{
         ObjectMeta: metav1.ObjectMeta{
@@ -734,12 +854,18 @@ func (p *Provisioner) EnsureDeployment(ctx context.Context, env *v1alpha1.Enviro
                     Labels: map[string]string{v1alpha1.ForgeLabel: env.Name},
                 },
                 Spec: corev1.PodSpec{
+                    // Prevent app Pods from accessing Kubernetes API credentials.
+                    AutomountServiceAccountToken: boolPtr(false),
                     SecurityContext: &corev1.PodSecurityContext{
                         RunAsNonRoot: boolPtr(true),
+                        SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
                     },
                     Containers: []corev1.Container{{
                         Name:  "app",
                         Image: image,
+                        Ports: []corev1.ContainerPort{{
+                            ContainerPort: env.Spec.Image.Port,
+                        }},
                         SecurityContext: &corev1.SecurityContext{
                             ReadOnlyRootFilesystem:   boolPtr(true),
                             AllowPrivilegeEscalation: boolPtr(false),
@@ -756,6 +882,29 @@ func (p *Provisioner) EnsureDeployment(ctx context.Context, env *v1alpha1.Enviro
                                 corev1.ResourceCPU:    resource.MustParse(env.Spec.Resources.CPULimit),
                                 corev1.ResourceMemory: resource.MustParse(env.Spec.Resources.MemoryLimit),
                             },
+                        },
+                        // HTTP readiness probe — ensures the gateway only routes after
+                        // the app is actually ready, not just after the container starts.
+                        ReadinessProbe: &corev1.Probe{
+                            ProbeHandler: corev1.ProbeHandler{
+                                HTTPGet: &corev1.HTTPGetAction{
+                                    Path: "/health/ready",
+                                    Port: intstr.FromInt32(env.Spec.Image.Port),
+                                },
+                            },
+                            InitialDelaySeconds: 2,
+                            PeriodSeconds:       3,
+                            FailureThreshold:    10,
+                        },
+                        LivenessProbe: &corev1.Probe{
+                            ProbeHandler: corev1.ProbeHandler{
+                                HTTPGet: &corev1.HTTPGetAction{
+                                    Path: "/health/live",
+                                    Port: intstr.FromInt32(env.Spec.Image.Port),
+                                },
+                            },
+                            InitialDelaySeconds: 5,
+                            PeriodSeconds:       10,
                         },
                         // emptyDir at /tmp so readOnlyRootFilesystem doesn't break framework writes
                         VolumeMounts: []corev1.VolumeMount{
@@ -845,11 +994,13 @@ func (w *WakeLock) Wake(ctx context.Context, envName string, triggerFn func(cont
 
     entry.err = triggerFn(ctx)
 
-    // Notify all waiters
+    // Close the channel and remove the entry atomically while holding the lock.
+    // If we deleted first and then closed, a new caller could arrive between
+    // delete and close, see no entry, and start a second restoration.
     w.mu.Lock()
+    close(entry.done)      // notify all waiters while still under lock
     delete(w.entries, envName)
     w.mu.Unlock()
-    close(entry.done)
 
     return entry.err
 }
@@ -858,24 +1009,38 @@ func (w *WakeLock) Wake(ctx context.Context, envName string, triggerFn func(cont
 ### HTTP handler chain (`pkg/gateway/handler.go`)
 
 ```go
+// Handler routes traffic for all preview environments.
+// IMPORTANT: This implementation uses process-local state (WakeLock, restoration semaphore).
+// Run exactly ONE gateway replica. Multiple replicas will each maintain independent
+// wake locks and semaphores, allowing duplicate restorations and exceeding global limits.
+// Distributed coordination (e.g., a Kubernetes Lease) is a future extension.
 type Handler struct {
-    envCache   cache.Cache
-    forgeAPI   *http.Client   // client to POST /api/v1/environments/:name/restore
-    forgeAPIURL string
-    wakeLock   *WakeLock
-    timeout    time.Duration  // default 60s
+    envCache        cache.Cache
+    forgeAPI        *http.Client   // client to POST /api/v1/environments/:name/restore
+    forgeAPIURL     string
+    forgeAPIToken   string         // bearer token; loaded from K8s Secret at startup
+    wakeLock        *WakeLock
+    capacityWorker  *capacity.Worker
+    timeout         time.Duration  // default 60s
+    domain          string         // e.g. "dev.local"
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-    envName := hostnameToEnvName(r.Host) // "pr-101.dev.local" → "pr-101"
+    // Validate and extract environment name from the hostname.
+    // Only accept requests matching "*.<domain>" — reject everything else.
+    envName := h.hostnameToEnvName(r.Host)
     if envName == "" {
         http.Error(w, "unknown host", http.StatusNotFound)
         return
     }
 
     state, err := GetEnvironmentState(h.envCache, envName)
-    if errors.IsNotFound(err) {
+    if apierrors.IsNotFound(err) {
         http.Error(w, "environment not found", http.StatusNotFound)
+        return
+    }
+    if err != nil {
+        http.Error(w, "failed to read environment state", http.StatusInternalServerError)
         return
     }
 
@@ -886,40 +1051,80 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     case v1alpha1.StateWarmHibernated, v1alpha1.StateDeepHibernated:
         h.wakeAndForward(w, r, envName)
 
-    case v1alpha1.StateProvisioning, v1alpha1.StateRestoring:
-        h.serveWakingPage(w, r, "Environment is starting up…")
+    case v1alpha1.StateRestoring:
+        // Join the existing wake lock rather than serving a waking page, so API
+        // clients get a forwarded response after readiness (not just 202).
+        // Browser clients also join but see a live-updating waking page while they wait.
+        h.wakeAndForward(w, r, envName)
+
+    case v1alpha1.StateProvisioning:
+        h.serveWakingPage(w, r, "Environment is being provisioned…")
 
     case v1alpha1.StateTerminating, v1alpha1.StateTerminated:
         http.Error(w, "environment has been terminated", http.StatusGone)
+
+    case v1alpha1.StateRestorationFailed:
+        // Incoming request resets the failed state so the operator retries.
+        h.wakeAndForward(w, r, envName)
 
     default:
         http.Error(w, "environment unavailable", http.StatusServiceUnavailable)
     }
 }
 
-func (h *Handler) wakeAndForward(w http.ResponseWriter, r *http.Request, envName string) {
-    ctx, cancel := context.WithTimeout(r.Context(), h.timeout)
-    defer cancel()
+// hostnameToEnvName parses "payments-pr-101.dev.local" → "payments-pr-101".
+// Returns "" for any hostname that does not end with ".<domain>" or contains
+// unexpected characters (prevents hostname injection attacks).
+func (h *Handler) hostnameToEnvName(host string) string {
+    // Strip port if present
+    if i := strings.LastIndex(host, ":"); i >= 0 {
+        host = host[:i]
+    }
+    suffix := "." + h.domain
+    if !strings.HasSuffix(host, suffix) {
+        return ""
+    }
+    name := strings.TrimSuffix(host, suffix)
+    // Validate: must look like a Kubernetes name
+    if matched, _ := regexp.MatchString(`^[a-z0-9][a-z0-9-]*[a-z0-9]$`, name); !matched {
+        return ""
+    }
+    return name
+}
 
-    // Acquire a global restoration slot before attempting wake-up
-    if err := h.capacityWorker.AcquireRestoreSlot(ctx); err != nil {
+func (h *Handler) wakeAndForward(w http.ResponseWriter, r *http.Request, envName string) {
+    // Per-request context for the HTTP handler itself (honours client disconnects).
+    reqCtx, reqCancel := context.WithTimeout(r.Context(), h.timeout)
+    defer reqCancel()
+
+    // The restore operation uses an INDEPENDENT context so that if one client
+    // disconnects, the shared restoration is not cancelled for all waiting clients.
+    restoreCtx, restoreCancel := context.WithTimeout(context.Background(), h.timeout)
+    defer restoreCancel()
+
+    // Deduplicate FIRST: all concurrent requests for the same environment block here
+    // until a single restoration either succeeds or fails.
+    // The restore OWNER is the only goroutine that acquires a global slot.
+    err := h.wakeLock.Wake(reqCtx, envName, func(_ context.Context) error {
+        // Only the owner reaches here. Acquire a global concurrent-restoration slot.
+        if err := h.capacityWorker.AcquireRestoreSlot(restoreCtx); err != nil {
+            if errors.Is(err, capacity.ErrQueueFull) {
+                return capacity.ErrQueueFull
+            }
+            return err
+        }
+        defer h.capacityWorker.ReleaseRestoreSlot()
+        return h.triggerRestore(restoreCtx, envName)
+    })
+
+    if err != nil {
         if errors.Is(err, capacity.ErrQueueFull) {
             w.Header().Set("Retry-After", "10")
             http.Error(w, "restoration queue full; retry later", http.StatusTooManyRequests)
             return
         }
-        http.Error(w, "environment restoration unavailable", http.StatusServiceUnavailable)
-        return
-    }
-    defer h.capacityWorker.ReleaseRestoreSlot()
-
-    err := h.wakeLock.Wake(ctx, envName, func(ctx context.Context) error {
-        return h.triggerRestore(ctx, envName)
-    })
-
-    if err != nil {
         if isAcceptHTML(r) {
-            h.serveErrorPage(w, "Wake-up timed out. Try refreshing.")
+            h.serveWakingPage(w, r, "Wake-up timed out. The environment is not ready yet — refresh to retry.")
         } else {
             http.Error(w, "environment restoration timed out", http.StatusServiceUnavailable)
         }
@@ -930,14 +1135,24 @@ func (h *Handler) wakeAndForward(w http.ResponseWriter, r *http.Request, envName
 }
 
 func (h *Handler) triggerRestore(ctx context.Context, envName string) error {
-    // POST /api/v1/environments/:name/restore
-    req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
-        h.forgeAPIURL+"/api/v1/environments/"+envName+"/restore", nil)
+    // POST /api/v1/environments/{name}/restore
+    req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+        h.forgeAPIURL+"/api/v1/environments/"+url.PathEscape(envName)+"/restore", nil)
+    if err != nil {
+        return err
+    }
+    req.Header.Set("Authorization", "Bearer "+h.forgeAPIToken)
+
     resp, err := h.forgeAPI.Do(req)
     if err != nil {
         return err
     }
     defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+        body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+        return fmt.Errorf("restore API returned %d: %s", resp.StatusCode, body)
+    }
 
     // Poll until ACTIVE or timeout (ctx handles the timeout)
     for {
@@ -954,24 +1169,33 @@ func (h *Handler) triggerRestore(ctx context.Context, envName string) error {
             return nil
         }
         if state == v1alpha1.StateRestorationFailed {
-            return fmt.Errorf("restoration failed")
+            return fmt.Errorf("restoration failed for %s", envName)
+        }
+        if state == v1alpha1.StateTerminating || state == v1alpha1.StateTerminated {
+            return fmt.Errorf("environment %s was terminated during restoration", envName)
         }
     }
 }
 
-// serveWakingPage returns an HTML page with a meta-refresh for browser clients
+var wakingPageTmpl = template.Must(template.New("waking").Parse(`<!DOCTYPE html>
+<html><head>
+<meta http-equiv="refresh" content="3">
+<title>Forge — Environment starting</title>
+</head><body>
+<h2>⏳ {{.Message}}</h2>
+<p>This page refreshes automatically every 3 seconds.</p>
+</body></html>`))
+
+// serveWakingPage returns an HTML page with a meta-refresh for browser clients.
+// Uses html/template to escape the message safely — never fmt.Fprintf with HTML.
 func (h *Handler) serveWakingPage(w http.ResponseWriter, r *http.Request, msg string) {
     if !isAcceptHTML(r) {
         http.Error(w, msg, http.StatusAccepted)
         return
     }
-    w.Header().Set("Content-Type", "text/html")
+    w.Header().Set("Content-Type", "text/html; charset=utf-8")
     w.WriteHeader(http.StatusAccepted)
-    fmt.Fprintf(w, `<!DOCTYPE html><html><head>
-<meta http-equiv="refresh" content="3">
-<title>Forge — Waking up</title></head><body>
-<h2>⏳ %s</h2><p>This page will refresh automatically.</p>
-</body></html>`, msg)
+    _ = wakingPageTmpl.Execute(w, struct{ Message string }{Message: msg})
 }
 
 func isAcceptHTML(r *http.Request) bool {
@@ -986,15 +1210,24 @@ func isAcceptHTML(r *http.Request) bool {
 ### Server setup (`cmd/api/main.go`)
 
 ```go
+// Go 1.22+ ServeMux supports method+path patterns with {name} placeholders.
+// Earlier Go: use a router library (chi, gorilla/mux) or parse the path manually.
 mux := http.NewServeMux()
-mux.Handle("/api/v1/environments",       methodHandler(h.ListEnvironments, h.CreateEnvironment))
-mux.Handle("/api/v1/environments/",      methodHandler(h.GetEnvironment, h.DeleteEnvironment))
-mux.Handle("/api/v1/environments//pin",  methodHandler(nil, h.PinEnvironment))
-mux.Handle("/api/v1/environments//restore", methodHandler(nil, h.RestoreEnvironment))
-mux.Handle("/healthz",                   http.HandlerFunc(healthz))
+mux.HandleFunc("GET  /api/v1/environments",                  h.ListEnvironments)
+mux.HandleFunc("POST /api/v1/environments",                  h.CreateEnvironment)
+mux.HandleFunc("GET  /api/v1/environments/{name}",           h.GetEnvironment)
+mux.HandleFunc("DELETE /api/v1/environments/{name}",         h.DeleteEnvironment)
+mux.HandleFunc("POST /api/v1/environments/{name}/pin",       h.PinEnvironment)
+mux.HandleFunc("POST /api/v1/environments/{name}/restore",   h.RestoreEnvironment)
+mux.HandleFunc("GET  /healthz",                              healthz)
 
-// Auth middleware: validates Bearer token
-handler := bearerTokenMiddleware(mux, os.Getenv("FORGE_API_TOKEN"))
+// Auth middleware: validates Bearer token using constant-time comparison.
+// Reject startup if FORGE_API_TOKEN is empty.
+token := os.Getenv("FORGE_API_TOKEN")
+if token == "" {
+    log.Fatal("FORGE_API_TOKEN must be set")
+}
+handler := bearerTokenMiddleware(mux, token)
 http.ListenAndServe(":8090", handler)
 ```
 
@@ -1002,9 +1235,16 @@ http.ListenAndServe(":8090", handler)
 
 ```go
 func bearerTokenMiddleware(next http.Handler, token string) http.Handler {
+    tokenBytes := []byte(token)
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         auth := r.Header.Get("Authorization")
-        if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != token {
+        if !strings.HasPrefix(auth, "Bearer ") {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        provided := []byte(strings.TrimPrefix(auth, "Bearer "))
+        // Constant-time comparison prevents timing attacks.
+        if subtle.ConstantTimeCompare(provided, tokenBytes) != 1 {
             http.Error(w, "unauthorized", http.StatusUnauthorized)
             return
         }
@@ -1084,15 +1324,25 @@ func (h *WebhookHandler) handlePullRequest(w http.ResponseWriter, r *http.Reques
         return
     }
 
-    envName := fmt.Sprintf("pr-%d", payload.PullRequest.Number)
+    // Include a sanitised repository slug so "pr-101" from two different repos
+    // does not collide. E.g. "payments" + PR 101 → "payments-pr-101".
+    // Truncate to stay within the 63-char Kubernetes name limit.
+    repoSlug := sanitizeRepoName(payload.Repository.Name) // e.g. "payments"
+    envName  := fmt.Sprintf("%s-pr-%d", repoSlug, payload.PullRequest.Number)
 
+    // Errors are returned as 5xx so GitHub retries the delivery.
+    var opErr error
     switch payload.Action {
     case "opened", "reopened":
-        h.createOrUpdateEnvironment(r.Context(), envName, payload)
+        opErr = h.createOrUpdateEnvironment(r.Context(), envName, payload)
     case "synchronize":
-        h.updateImageTag(r.Context(), envName, payload)
+        opErr = h.updateImageTag(r.Context(), envName, payload)
     case "closed":
-        h.terminateEnvironment(r.Context(), envName)
+        opErr = h.terminateEnvironment(r.Context(), envName)
+    }
+    if opErr != nil {
+        http.Error(w, "failed to process webhook event", http.StatusInternalServerError)
+        return
     }
 
     w.WriteHeader(http.StatusNoContent)
@@ -1263,8 +1513,14 @@ The gateway's `wakeAndForward` calls `AcquireRestoreSlot` before entering the `W
 ### Minikube registry reachability
 
 ```bash
-# Start local registry on the laptop
-docker run -d -p 5000:5000 --name registry registry:2
+# Start local registry with a named volume (data survives container restarts/removals)
+# and a restart policy (survives laptop reboots).
+docker run -d \
+  --restart unless-stopped \
+  -p 5000:5000 \
+  -v registry-data:/var/lib/registry \
+  --name registry \
+  registry:2
 
 # Start Minikube with insecure registry (required — localhost:5000 is NOT reachable inside Minikube)
 minikube start --insecure-registry="host.minikube.internal:5000"
@@ -1342,14 +1598,14 @@ webhook:
   githubSecretName: forge-github-webhook-secret
 
 defaults:
-  inactivityTimeout: "15m"
   warmHibernateAfter: "15m"
   deepHibernateAfter: "2h"
   ttl: "72h"
+  # Must be consistent with the per-namespace ResourceQuota: cpuRequest <= quota requests.cpu
   resources:
-    cpuRequest: "100m"
+    cpuRequest: "200m"
     cpuLimit: "500m"
-    memoryRequest: "128Mi"
+    memoryRequest: "256Mi"
     memoryLimit: "512Mi"
 ```
 
@@ -1401,17 +1657,22 @@ build:
 test:
 	KUBEBUILDER_ASSETS="$(shell setup-envtest use --print path)" go test ./... -v
 
-# Build Docker images
+# Build Docker images (all 4 components; tagged with immutable Git SHA — never latest)
 docker-build:
 	docker build -f Dockerfile.operator -t host.minikube.internal:5000/forge-operator:$(GIT_SHA) .
 	docker build -f Dockerfile.gateway  -t host.minikube.internal:5000/forge-gateway:$(GIT_SHA)  .
 	docker build -f Dockerfile.api      -t host.minikube.internal:5000/forge-api:$(GIT_SHA)      .
+	docker build -f Dockerfile.webhook  -t host.minikube.internal:5000/forge-webhook:$(GIT_SHA)  .
 
-# Trivy scan all images
+# Trivy scan all 4 Forge component images
 trivy-scan:
 	trivy image --exit-code 1 --severity HIGH,CRITICAL host.minikube.internal:5000/forge-operator:$(GIT_SHA)
 	trivy image --exit-code 1 --severity HIGH,CRITICAL host.minikube.internal:5000/forge-gateway:$(GIT_SHA)
 	trivy image --exit-code 1 --severity HIGH,CRITICAL host.minikube.internal:5000/forge-api:$(GIT_SHA)
+	trivy image --exit-code 1 --severity HIGH,CRITICAL host.minikube.internal:5000/forge-webhook:$(GIT_SHA)
+	# Note: PR application images must also pass a Trivy scan in the PR's own build
+	# pipeline before the Forge operator deploys them. Use the same threshold.
+	# trivy image --exit-code 1 --severity HIGH,CRITICAL <app-image>:$(APP_SHA)
 
 # Push to local registry
 docker-push:
@@ -1423,15 +1684,26 @@ docker-push:
 apply-crds:
 	kubectl apply -f config/crd/
 
-# Deploy Forge via Helm
-deploy:
+# Apply CRDs before helm upgrade (helm upgrade does NOT upgrade CRDs in crds/)
+apply-crds:
+	kubectl apply -f config/crd/
+
+# Deploy Forge via Helm — always apply CRDs first
+deploy: apply-crds
 	helm upgrade --install forge ./charts/forge \
 	  --namespace forge-system --create-namespace \
 	  --set operator.image.tag=$(GIT_SHA) \
 	  --set gateway.image.tag=$(GIT_SHA) \
-	  --set api.image.tag=$(GIT_SHA)
-	kubectl rollout status deployment/forge-operator -n forge-system
-	kubectl rollout status deployment/forge-gateway  -n forge-system
+	  --set api.image.tag=$(GIT_SHA) \
+	  --set webhook.image.tag=$(GIT_SHA)
+	kubectl rollout status deployment/forge-operator  -n forge-system --timeout=120s
+	kubectl rollout status deployment/forge-gateway   -n forge-system --timeout=120s
+	kubectl rollout status deployment/forge-api       -n forge-system --timeout=120s
+	kubectl rollout status deployment/forge-webhook   -n forge-system --timeout=120s
+
+# Post-deployment smoke test: create a test environment and verify it reaches ACTIVE
+smoke-test:
+	./hack/smoke-test.sh
 ```
 
 ---
