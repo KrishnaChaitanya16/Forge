@@ -350,19 +350,37 @@ This pipeline serves two purposes: (1) building and deploying Forge itself, and 
 
 **Helm chart for Forge:** Forge's own components (operator, gateway, API server, webhook receiver) are packaged as a Helm chart under `charts/forge/`. This satisfies the IaC/config management requirement alongside Ansible.
 
-**Ansible role:** Ansible playbooks handle machine setup — installing Minikube, kubectl, Helm, Docker, and the local registry. This is the config management layer. The Helm chart is the K8s deployment layer. Both are required by the rubric.
+**Ansible roles:** Ansible handles machine setup using modular **roles** (not flat playbooks). Each role is independently reusable:
+
+```
+ansible/
+  roles/
+    docker/        ← installs Docker engine
+    kubectl/       ← installs kubectl + kubeconfig
+    minikube/      ← installs + starts Minikube
+    helm/          ← installs Helm
+    registry/      ← starts local Docker registry with persistent volume
+    vault/         ← installs Vault CLI, starts Vault dev server, seeds initial secrets
+    elk/           ← installs Filebeat on the host (ELK runs in K8s)
+  site.yml         ← runs all roles in order
+```
+
+**Docker Compose (local dev):** A `docker-compose.yml` at the repo root lets developers run all 4 Forge components + Prometheus + Grafana + ELK on a laptop without Kubernetes. Used for fast local iteration; not used in the Jenkins pipeline or production deploy.
 
 **Helm and CRDs:** CRD manifests placed under `charts/forge/crds/` are installed by `helm install` but **not upgraded by `helm upgrade`**. The `deploy` pipeline stage always runs `kubectl apply -f config/crd/` before `helm upgrade` to ensure the API server has the latest schema before the new operator version starts. A schema mismatch between operator and CRD will cause immediate reconciliation failures. After CRD apply and before operator rollout, the pipeline verifies the CRD version matches what the new operator image expects (checked via a `forge-crd-check` init container or a simple `kubectl get crd` version label check).
 
-**Pipeline stages (8 total):**
+**Pipeline stages (9 total):**
 1. Lint + vet
 2. Test (envtest, go test -race)
 3. Build Docker images (operator, gateway, API, webhook)
 4. Trivy scan — all 4 images; fail on HIGH/CRITICAL
-5. Push to local registry (tagged with Git SHA — never `latest`)
-6. Apply CRDs (`kubectl apply -f config/crd/`)
-7. Helm deploy (`helm upgrade --install forge ...`)
-8. Rollout verify — all 4 components + post-deploy smoke test
+5. Push to Docker Hub (tagged with Git SHA — never `latest`)
+6. Push to local registry (same images, for Minikube pull)
+7. Apply CRDs (`kubectl apply -f config/crd/`)
+8. Helm deploy (`helm upgrade --install forge ...`)
+9. Rollout verify — all 4 components + post-deploy smoke test
+
+**Docker Hub push (stage 5):** Jenkins reads `DOCKER_HUB_CREDENTIALS` from Vault (see §7 Secrets Management). Images are pushed as `{dockerhub-user}/forge-{component}:{git-sha}`. Local registry (stage 6) is kept as the pull source for Minikube since Docker Hub rate limits can break CI.
 
 **Rollout verification (stage 8):**
 ```bash
@@ -389,6 +407,9 @@ If any rollout times out or the smoke test fails, the pipeline stage fails and t
 | Config management | Ansible | SPE default; playbooks configure the laptop environment (Minikube, kubectl, Helm, registry) |
 | K8s packaging | Helm | Templates Forge's own K8s manifests; parameterises image tags per pipeline run |
 | Monitoring | Prometheus + Grafana | SPE default; Forge exposes custom metrics via `/metrics` endpoint using `prometheus/client_golang` |
+| Logging | ELK Stack (Elasticsearch + Logstash + Kibana) | Mandatory SPE requirement; Forge components emit structured JSON logs to stdout; Filebeat sidecar ships them to Logstash |
+| Secret management | HashiCorp Vault | Stores Docker Hub credentials, Forge API token, GitHub webhook secret; Vault Agent sidecar injects secrets as files at runtime |
+| Local dev | Docker Compose | `docker-compose.yml` at repo root; spins up all 4 Forge components + Prometheus + Grafana + ELK on a laptop without Kubernetes |
 | Image scanning | Trivy | Single binary; zero config; scans in CI with `--exit-code 1`; DevSecOps extension |
 | Image registry | Local Docker registry via `host.minikube.internal:5000` | `localhost:5000` on the laptop is not `localhost` inside the Minikube node VM. Use `host.minikube.internal:5000` as the registry address inside the cluster, and start the registry with `--insecure-registry host.minikube.internal:5000` flag on Minikube. Alternatively use the Minikube registry addon (`minikube addons enable registry`). |
 | Gateway | Go `net/http` | Full control over routing, hibernation detection, wake-up deduplication logic |
@@ -473,9 +494,24 @@ Principle: each component gets only the verbs it actually needs. The gateway can
 
 ### Secrets Management
 
-- GitHub webhook secret → Kubernetes `Secret`, mounted as env var in webhook receiver. **Never in Helm values or committed to git.**
-- Local registry credentials (if any) → Kubernetes `Secret` of type `kubernetes.io/dockerconfigjson`
-- Forge API token (see below) → Kubernetes `Secret`, mounted in API server
+All secrets are stored in **HashiCorp Vault** (deployed to `forge-system` namespace in dev mode for the demo). Vault Agent sidecars inject secrets as files into each component's Pod at startup — no secrets in Helm values, no secrets committed to git.
+
+| Secret | Vault path | Consumer |
+|---|---|---|
+| GitHub webhook HMAC secret | `secret/forge/github-webhook` | Webhook receiver |
+| Forge API bearer token | `secret/forge/api-token` | API server + Gateway |
+| Docker Hub credentials | `secret/forge/dockerhub` | Jenkins (read via Vault CLI in pipeline) |
+| Local registry credentials | `secret/forge/registry` | Kubernetes `imagePullSecret` |
+
+**How it works at runtime:**
+```
+Pod starts → Vault Agent init container authenticates with K8s ServiceAccount
+           → pulls secrets from Vault
+           → writes them as files to /vault/secrets/
+           → main container reads files (never env vars)
+```
+
+**Ansible role** (`roles/vault/`) handles Vault installation and initial secret seeding on the laptop.
 
 ### API Authentication
 
@@ -574,6 +610,52 @@ Standard Prometheus + cAdvisor gives CPU/memory of running Pods. But they don't 
 
 ---
 
+### ELK Stack (Logging)
+
+Forge uses **ELK** (Elasticsearch + Logstash + Kibana) for centralised log aggregation — mandatory SPE requirement alongside Prometheus for metrics.
+
+**How logs flow:**
+
+```
+Forge Pod (stdout JSON logs)
+  → Filebeat sidecar container
+  → Logstash (port 5044) — parses + enriches with component/environment labels
+  → Elasticsearch (stores + indexes)
+  → Kibana (visualises)
+```
+
+**Deployment:** ELK runs in the `forge-logging` namespace on Minikube, deployed via Helm (`elastic/elasticsearch`, `elastic/logstash`, `elastic/kibana` charts).
+
+**What Forge logs (structured JSON on stdout):**
+
+| Component | Key log events |
+|---|---|
+| Operator | Reconcile start/end, state transitions, provisioning errors |
+| Gateway | Request received, wake triggered, restore complete, 429 returned |
+| API server | Environment created/deleted, restore triggered |
+| Webhook | PR event received, environment create/delete dispatched |
+
+**Filebeat sidecar (added to all 4 Helm Deployment templates):**
+```yaml
+- name: filebeat
+  image: docker.elastic.co/beats/filebeat:8.11.0
+  args: ["-c", "/etc/filebeat/filebeat.yml", "-e"]
+  volumeMounts:
+  - name: filebeat-config
+    mountPath: /etc/filebeat
+```
+
+**Kibana dashboards:**
+- **Dashboard 1:** Forge component logs by level (INFO/WARN/ERROR) over time
+- **Dashboard 2:** State transition log stream per environment (trace a single PR through its lifecycle)
+- **Dashboard 3:** Error log count by component — shows which component has most failures
+
+**Metrics vs Logs distinction:**
+- Prometheus answers "how many environments are hibernated right now?"
+- Kibana answers "why did environment `myrepo-pr-42` fail to restore at 14:32?"
+
+---
+
 ## 9. Test Strategy
 
 Without tests, state-machine bugs only surface during the live demo. Two layers are required.
@@ -658,10 +740,11 @@ Envtest binaries are downloaded via `setup-envtest` from `sigs.k8s.io/controller
 |---|---|---|
 | 2026-11-04 | Kickoff | Team registered, topic abstract submitted |
 | 2026-11-11 | Proposal | 1-page proposal: app, architecture, tools, extension |
-| 2026-11-25 | Pipeline working | Automated CI/CD building and deploying Forge to Minikube |
-| 2026-12-02 | Deployed + observable | Forge running on K8s with Grafana dashboards live |
-| 2026-12-04 | Final briefing | Demo logistics, report submission opens |
-| 2026-12-07–12 | Final demo & viva | Live end-to-end demo + individual Q&A |
+| 2026-11-25 | Pipeline working | Jenkins pipeline builds, scans, pushes all 4 images; deploys Forge to Minikube |
+| 2026-12-02 | Core lifecycle | Provisioning + hibernation + gateway routing working end-to-end |
+| 2026-12-09 | Full system | Restoration + termination + Prometheus + Grafana live |
+| 2026-12-14 | Demo rehearsal | Full demo dry run; smoke test passes |
+| 2026-12-15 | Final demo & viva | Live end-to-end demo + individual Q&A |
 
 ### Work Split (recommended)
 
