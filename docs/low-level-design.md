@@ -1,6 +1,6 @@
 # Forge — Low-Level Design
 
-> Living document · Last updated: 2026-11-02
+> Living document · Last updated: 2026-11-23
 > This document is the implementation blueprint. Update it as code is written and decisions are refined.
 
 ---
@@ -15,10 +15,13 @@
 6. [Gateway — Handler Chain & Wake Lock](#6-gateway--handler-chain--wake-lock)
 7. [Environment API — Handlers & Middleware](#7-environment-api--handlers--middleware)
 8. [Webhook Receiver — Event Processing](#8-webhook-receiver--event-processing)
+8a. [Drift Detection](#8a-drift-detection)
 9. [Capacity Worker — Serialized Admission](#9-capacity-worker--serialized-admission)
 10. [Networking — DNS & NetworkPolicy Rules](#10-networking--dns--networkpolicy-rules)
 11. [Configuration Reference](#11-configuration-reference)
 12. [Makefile Targets](#12-makefile-targets)
+13. [Metrics Registry](#13-metrics-registry)
+14. [Shared Helpers](#14-shared-helpers)
 
 ---
 
@@ -31,8 +34,10 @@ forge/
 │   │   └── main.go          controller-runtime manager setup
 │   ├── gateway/
 │   │   └── main.go          HTTP server + informer setup
-│   └── api/
-│       └── main.go          REST API server
+│   ├── api/
+│   │   └── main.go          REST API server
+│   └── webhook/
+│       └── main.go          GitHub webhook receiver
 │
 ├── pkg/
 │   ├── api/
@@ -58,16 +63,29 @@ forge/
 │   │   ├── namespace.go      create/delete namespace + quota + netpol
 │   │   ├── deployment.go     create/patch/delete Deployment
 │   │   ├── service.go        create/delete Service
-│   │   └── ingress.go        create/delete Ingress
+│   │   ├── ingress.go        create/delete Ingress
+│   │   └── workloads.go      inventory, scale, HPA capture/restore
 │   │
 │   ├── gateway/
 │   │   ├── handler.go        HTTP handler: route → state check → forward/wake
 │   │   ├── wakelock.go       per-environment wake deduplication
 │   │   ├── informer.go       controller-runtime cache for Environment state
+│   │   ├── drift_banner.go   ModifyResponse banner injection
+│   │   ├── pages.go          waking + rebase-required html/template pages
 │   │   └── handler_test.go
 │   │
+│   ├── webhook/
+│   │   ├── handler.go        signature validation + event dispatch
+│   │   ├── predictive.go     intent signals → predictive wake
+│   │   ├── drift.go          base-branch comparison + auto-rebuild
+│   │   └── handler_test.go
+│   │
+│   ├── github/
+│   │   └── client.go         CompareCommits (ETag-cached), TriggerRebuild
+│   │
 │   ├── capacity/
-│   │   ├── worker.go         single-goroutine admission serializer
+│   │   ├── worker.go         operator-side admission serializer (Admitter)
+│   │   ├── restoration.go    gateway-side semaphore (RestoreLimiter)
 │   │   └── queue.go          FIFO provisioning queue
 │   │
 │   └── metrics/
@@ -84,30 +102,44 @@ forge/
 │       └── environment_sample.yaml
 │
 ├── charts/
-│   └── forge/
-│       ├── Chart.yaml
-│       ├── values.yaml
-│       ├── crds/                  installed by helm install, NOT helm upgrade
-│       └── templates/
-│           ├── operator/          Deployment, ServiceAccount, ClusterRoleBinding
-│           ├── gateway/           Deployment, Service, ServiceAccount
-│           ├── api/               Deployment, Service, ServiceAccount
-│           └── webhook/           Deployment, Service, ServiceAccount
+│   ├── forge/
+│   │   ├── Chart.yaml
+│   │   ├── values.yaml
+│   │   ├── crds/                  installed by helm install, NOT helm upgrade
+│   │   └── templates/
+│   │       ├── operator/          Deployment, ServiceAccount, ClusterRoleBinding
+│   │       ├── gateway/           Deployment (replicas pinned to 1), Service, SA
+│   │       ├── api/               Deployment, Service, ServiceAccount
+│   │       ├── webhook/           Deployment, Service, ServiceAccount, HPA
+│   │       └── filebeat-config.yaml  sidecar config shared by all 4 components
+│   └── elk/
+│       ├── Chart.yaml             wraps elastic/elasticsearch, logstash, kibana
+│       └── values.yaml            forge-logging namespace
 │
 ├── ansible/
 │   ├── inventory.yml
-│   └── playbooks/
-│       ├── install-deps.yml       minikube, kubectl, helm, docker
-│       ├── configure-registry.yml local registry + minikube insecure-registry
-│       └── setup-cluster.yml      start minikube, apply CRDs
+│   ├── site.yml                   runs every role in order
+│   └── roles/
+│       ├── docker/tasks/main.yml
+│       ├── kubectl/tasks/main.yml
+│       ├── minikube/tasks/main.yml
+│       ├── helm/tasks/main.yml
+│       ├── registry/tasks/main.yml    local registry + insecure-registry flag
+│       ├── vault/tasks/main.yml       dev server + seed secrets
+│       └── elk/tasks/main.yml         host-side Filebeat prerequisites
 │
 ├── hack/
-│   └── setup-envtest.sh       download envtest binaries for CI
+│   ├── setup-envtest.sh       download envtest binaries for CI
+│   ├── smoke-test.sh          post-deploy verification (pipeline stage 9)
+│   ├── grafana/               dashboard JSON
+│   └── kibana/                dashboard + index pattern JSON
 │
 ├── Makefile
+├── docker-compose.yml         local dev: 4 components + Prometheus + Grafana + ELK
 ├── Dockerfile.operator
 ├── Dockerfile.gateway
 ├── Dockerfile.api
+├── Dockerfile.webhook
 └── go.mod
 ```
 
@@ -128,6 +160,8 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 // +kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.lifecycleState`
 // +kubebuilder:printcolumn:name="PR",type=integer,JSONPath=`.spec.pullRequest`
 // +kubebuilder:printcolumn:name="URL",type=string,JSONPath=`.status.previewURL`
+// +kubebuilder:printcolumn:name="Behind",type=integer,JSONPath=`.status.drift.commitsBehind`
+// +kubebuilder:printcolumn:name="Stale",type=boolean,JSONPath=`.status.drift.stale`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 type Environment struct {
     metav1.TypeMeta   `json:",inline"`
@@ -154,8 +188,45 @@ type EnvironmentSpec struct {
     Image     ImageSpec       `json:"image"`
     Resources ResourceSpec    `json:"resources,omitempty"`
     Lifecycle LifecyclePolicy `json:"lifecycle,omitempty"`
+    Drift     DriftPolicy     `json:"drift,omitempty"`
     // MVP: stateless only. Persistent is reserved for future use.
     Storage   StorageSpec     `json:"storage,omitempty"`
+
+    // Base branch this PR targets, e.g. "main". Taken from the webhook payload
+    // (pull_request.base.ref). Required for drift detection; drift is skipped
+    // if empty.
+    // +kubebuilder:validation:MaxLength=255
+    BaseBranch string `json:"baseBranch,omitempty"`
+
+    // Full name of the repo that owns the BASE branch, e.g. "team-a/payments".
+    // For fork PRs this differs from the head repo, so it is stored explicitly.
+    // +kubebuilder:validation:MaxLength=255
+    BaseRepo string `json:"baseRepo,omitempty"`
+}
+
+type DriftPolicy struct {
+    // Policy applied when the base branch has moved ahead of this environment's
+    // branch point beyond CommitThreshold.
+    //   warn:         gateway injects a banner into HTML responses (default)
+    //   auto-rebuild: triggers a rebuild with the rebased base (rate-limited)
+    //   block:        gateway returns 409 with a "rebase required" page
+    //   off:          drift is tracked in status but no action is taken
+    // +kubebuilder:validation:Enum=warn;auto-rebuild;block;off
+    // +kubebuilder:default="warn"
+    Policy string `json:"policy,omitempty"`
+
+    // Number of commits the base branch may move ahead before the environment
+    // is marked stale. 0 disables the commit-count trigger.
+    // +kubebuilder:validation:Minimum=0
+    // +kubebuilder:default=10
+    CommitThreshold int `json:"commitThreshold,omitempty"`
+
+    // Wall-clock age of the branch point before the environment is marked stale,
+    // regardless of commit count. Empty disables the age trigger.
+    // Either trigger firing marks the environment stale.
+    // +kubebuilder:validation:Pattern=`^[0-9]+h$`
+    // +kubebuilder:default="72h"
+    MaxAge string `json:"maxAge,omitempty"`
 }
 
 type ImageSpec struct {
@@ -197,6 +268,18 @@ type LifecyclePolicy struct {
     // +kubebuilder:validation:Enum=pinned;high;normal;low
     // +kubebuilder:default="normal"
     Priority string `json:"priority,omitempty"`
+
+    // PredictiveWake enables restoring this environment from GitHub intent
+    // signals (reviewer assigned, CI passed) before a request arrives.
+    // +kubebuilder:default=true
+    PredictiveWake *bool `json:"predictiveWake,omitempty"`
+
+    // How long a predictively-woken environment stays up waiting for the
+    // reviewer who never arrived. Shorter than WarmHibernateAfter because a
+    // speculative wake should not hold a slot as long as real traffic does.
+    // +kubebuilder:validation:Pattern=`^[0-9]+(m|h)$`
+    // +kubebuilder:default="10m"
+    PredictiveWakeTTL string `json:"predictiveWakeTTL,omitempty"`
 }
 
 type ResourceSpec struct {
@@ -265,10 +348,47 @@ type EnvironmentStatus struct {
     // Environment is accepted (created), not when it first becomes ready.
     ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
 
-    // Immutable image digest of the currently deployed image (sha256:...).
+    // Immutable OCI image digest of the currently deployed image (sha256:...).
     // Populated after the first successful Deployment rollout.
     // Used during restoration to avoid tag ambiguity.
+    // NOT a git SHA — never pass this to a git comparison API.
     ImageDigest string `json:"imageDigest,omitempty"`
+
+    // Git commit SHA at the head of the PR branch, from pull_request.head.sha.
+    // Set on `opened` and refreshed on every `synchronize`. This is the commit
+    // drift detection compares against the base branch; ImageDigest is an OCI
+    // digest and is unrelated to git history.
+    // +kubebuilder:validation:MaxLength=40
+    HeadSHA string `json:"headSHA,omitempty"`
+
+    // What triggered the current/last restoration. Used to decide the post-restore
+    // inactivity window (predictive wakes get PredictiveWakeTTL, not WarmHibernateAfter)
+    // and to label the forge_predictive_wakeups_total metric.
+    // +kubebuilder:validation:Enum=reactive;predictive
+    RestorationTrigger string `json:"restorationTrigger,omitempty"`
+
+    // Inventory of workloads scaled down or deleted at hibernation time, so the
+    // original replica counts are restored (not hard-coded to 1) and so that
+    // workloads Forge did not create are scaled back correctly.
+    // Capped at 20 entries; environments with more workloads are rejected at admission.
+    // +kubebuilder:validation:MaxItems=20
+    HibernatedWorkloads []HibernatedWorkload `json:"hibernatedWorkloads,omitempty"`
+
+    // Workload kinds present in the namespace that Forge does not manage
+    // (StatefulSet, DaemonSet). Surfaced so a partially-hibernated environment is
+    // visible rather than silently wrong. MVP does not hibernate these.
+    // +kubebuilder:validation:MaxItems=10
+    UnmanagedWorkloads []string `json:"unmanagedWorkloads,omitempty"`
+
+    // Set when hibernation was attempted and refused (too many workloads).
+    // The lifecycle manager skips environments with this set, otherwise it
+    // re-requests hibernation every tick and the environment flaps forever.
+    // Cleared on the next successful inventory.
+    HibernationBlocked bool `json:"hibernationBlocked,omitempty"`
+
+    // Drift state relative to the base branch. Written by the webhook receiver
+    // via a targeted status patch; read by the gateway for banner/block decisions.
+    Drift *DriftStatus `json:"drift,omitempty"`
 
     // Human-readable status message
     Message string `json:"message,omitempty"`
@@ -276,8 +396,48 @@ type EnvironmentStatus struct {
     // Last generation the operator successfully reconciled
     ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-    // Standard Kubernetes condition list
+    // Standard Kubernetes condition list. Capped to bound status object size.
+    // +kubebuilder:validation:MaxItems=5
     Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+type HibernatedWorkload struct {
+    // +kubebuilder:validation:Enum=Deployment;CronJob
+    Kind string `json:"kind"`
+    Name string `json:"name"`
+    // Replica count at the moment of hibernation, restored verbatim on wake.
+    // Ignored for CronJob (which is suspended/unsuspended instead).
+    OriginalReplicas int32 `json:"originalReplicas"`
+    // True if Forge created this workload from spec and can therefore delete and
+    // recreate it during deep hibernation. Workloads Forge did not create are
+    // only ever scaled to zero, never deleted — their spec cannot be reconstructed.
+    ForgeOwned bool `json:"forgeOwned"`
+    // Name of an HPA targeting this workload, captured and deleted at hibernation
+    // so it cannot fight the scale-to-zero, and recreated from HPASpec on restore.
+    HPAName string `json:"hpaName,omitempty"`
+    // Serialised autoscaling/v2 HPA spec, retained only while HPAName is set.
+    HPASpec string `json:"hpaSpec,omitempty"`
+}
+
+type DriftStatus struct {
+    // Commit SHA where this PR branched from the base branch (the merge base).
+    // Recomputed on every `synchronize` event because a rebase moves it.
+    BranchPoint string `json:"branchPoint,omitempty"`
+    // Current HEAD of the base branch at LastCheckedAt.
+    BaseHead string `json:"baseHead,omitempty"`
+    // Commits the base branch is ahead of BranchPoint.
+    CommitsBehind int `json:"commitsBehind,omitempty"`
+    // When the branch point commit was authored. Drives the MaxAge trigger.
+    BranchPointAt *metav1.Time `json:"branchPointAt,omitempty"`
+    // True when CommitThreshold or MaxAge has been exceeded.
+    Stale bool `json:"stale,omitempty"`
+    // When drift was last successfully evaluated.
+    LastCheckedAt *metav1.Time `json:"lastCheckedAt,omitempty"`
+    // Last error from the GitHub compare API. Non-empty means CommitsBehind is
+    // stale data; drift never fails the environment, it only degrades to unknown.
+    LastCheckError string `json:"lastCheckError,omitempty"`
+    // Last time an auto-rebuild was triggered. Enforces the rebuild cooldown.
+    LastRebuildAt *metav1.Time `json:"lastRebuildAt,omitempty"`
 }
 
 type LifecycleState string
@@ -297,7 +457,32 @@ const (
 const (
     ForgeFinalizer = "forge.dev/cleanup"
     ForgeLabel     = "forge.dev/environment"
-    GracePeriod    = 5 * time.Minute
+    // ForgeOwnedLabel marks workloads Forge created itself. Only these are deleted
+    // during deep hibernation, because only these can be recreated from spec.
+    ForgeOwnedLabel = "forge.dev/owned"
+
+    // Minimum time an environment stays up after a restore, so the 60s lifecycle
+    // tick cannot re-hibernate it before the user's first request lands.
+    //
+    // MUST be shorter than the smallest warm-hibernate threshold. `low` priority
+    // warms after 5m; a 5m grace period would exactly cancel it, so a restored
+    // low-priority environment could never hibernate on its first idle window.
+    GracePeriod = 2 * time.Minute
+
+    // Minimum interval between two auto-rebuilds of the same environment.
+    // Without this, a busy base branch rebuilds an environment in a loop:
+    // rebuild → synchronize → drift recheck → still behind → rebuild.
+    DriftRebuildCooldown = 1 * time.Hour
+
+    // Maximum workloads Forge will hibernate in one namespace. Beyond this the
+    // status object and the parallel scale fan-out both become unreasonable.
+    MaxHibernatedWorkloads = 20
+)
+
+// RestorationTrigger values.
+const (
+    TriggerReactive   = "reactive"   // a real HTTP request arrived at the gateway
+    TriggerPredictive = "predictive" // a GitHub intent signal fired
 )
 
 // +kubebuilder:object:root=true
@@ -305,6 +490,26 @@ type EnvironmentList struct {
     metav1.TypeMeta `json:",inline"`
     metav1.ListMeta `json:"metadata,omitempty"`
     Items           []Environment `json:"items"`
+}
+```
+
+### Scheme registration (`pkg/api/v1alpha1/register.go`)
+
+```go
+var (
+    GroupVersion  = schema.GroupVersion{Group: "forge.dev", Version: "v1alpha1"}
+    SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+    AddToScheme   = SchemeBuilder.AddToScheme
+
+    // GroupVersionKind is required by metav1.NewControllerRef when the operator
+    // sets the Environment as owner of the managed Namespace. Without the owner
+    // reference the Namespace is never garbage-collected and cascade deletion of
+    // everything inside it silently does not happen.
+    GroupVersionKind = GroupVersion.WithKind("Environment")
+)
+
+func init() {
+    SchemeBuilder.Register(&Environment{}, &EnvironmentList{})
 }
 ```
 
@@ -332,15 +537,28 @@ func main() {
         LeaderElectionID:       "forge-operator-leader",
     })
 
+    // Domain is injected from Helm values and MUST match the gateway's --domain.
+    // The reconciler writes Status.PreviewURL as "<env.Name>.<domain>" and the
+    // gateway validates the hostname suffix against its own copy; a mismatch makes
+    // every preview URL 404 with no error anywhere.
+    domain := mustEnv("FORGE_DOMAIN") // e.g. "dev.local"
+    // Namespace the gateway runs in — named in the allow-ingress NetworkPolicy.
+    gatewayNamespace := mustEnv("FORGE_GATEWAY_NAMESPACE") // "forge-system"
+    // Registry address as seen from INSIDE the Minikube VM.
+    registry := mustEnv("FORGE_REGISTRY") // "host.minikube.internal:5000"
+    maxActiveEnvs := mustEnvInt("FORGE_MAX_ACTIVE_ENVIRONMENTS") // 10
+
     capacityWorker := capacity.NewWorker(mgr.GetClient(), maxActiveEnvs)
     lifecycleMgr   := lifecycle.NewManager(mgr.GetClient(), capacityWorker)
 
     if err = (&controller.EnvironmentReconciler{
-        Client:          mgr.GetClient(),
-        Scheme:          mgr.GetScheme(),
-        CapacityWorker:  capacityWorker,
+        Client:           mgr.GetClient(),
+        Scheme:           mgr.GetScheme(),
+        Domain:           domain,
+        Provisioner:      provisioner.New(mgr.GetClient(), gatewayNamespace, registry),
+        CapacityWorker:   capacityWorker,
         LifecycleManager: lifecycleMgr,
-        Recorder:        mgr.GetEventRecorderFor("forge-operator"),
+        Recorder:         mgr.GetEventRecorderFor("forge-operator"),
     }).SetupWithManager(mgr); err != nil {
         // handle err
     }
@@ -348,6 +566,24 @@ func main() {
     go lifecycleMgr.Run(ctx)
     go capacityWorker.Run(ctx)
     mgr.Start(ctx)
+}
+```
+
+### Reconciler struct (`pkg/controller/environment_controller.go`)
+
+```go
+type EnvironmentReconciler struct {
+    client.Client
+    Scheme   *runtime.Scheme
+    Recorder record.EventRecorder
+
+    // Domain suffix for preview URLs, from FORGE_DOMAIN. Must equal the gateway's
+    // configured domain — both Helm templates read the same value.
+    Domain string
+
+    Provisioner      *provisioner.Provisioner
+    CapacityWorker   capacity.Admitter
+    LifecycleManager *lifecycle.Manager
 }
 ```
 
@@ -399,6 +635,52 @@ func (r *EnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request)
     }
 }
 
+// reconcileActive is the steady state. It does two things.
+//
+// 1. Re-provisions when the spec changed. A new commit arrives as `synchronize`,
+//    which patches Spec.Image.Tag and therefore bumps metadata.Generation. The
+//    environment is ACTIVE at that point, so without this branch the new image
+//    would never be rolled out — the PR would keep showing the old code, which is
+//    exactly the staleness drift detection exists to warn about.
+// 2. Clears the hibernation inventory. HibernatedWorkloads records replica counts
+//    captured at the last hibernation; once the environment is ACTIVE a user may
+//    scale their own Deployment, making those counts stale. Clearing here forces
+//    the next hibernation to take a fresh inventory.
+func (r *EnvironmentReconciler) reconcileActive(ctx context.Context, env *v1alpha1.Environment) (ctrl.Result, error) {
+    ns := env.Status.NamespaceName
+
+    if env.Status.ObservedGeneration != env.Generation {
+        // Spec changed — image tag, resources or port. Route back through
+        // provisioning, which is create-or-update and therefore performs a rolling
+        // update rather than a recreate.
+        return r.reconcileProvisioning(ctx, env)
+    }
+
+    if len(env.Status.HibernatedWorkloads) > 0 {
+        patch := client.MergeFrom(env.DeepCopy())
+        env.Status.HibernatedWorkloads = nil
+        if err := r.Status().Patch(ctx, env, patch); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
+
+    // Capture the digest if provisioning finished before any Pod was ready.
+    if env.Status.ImageDigest == "" {
+        if digest, err := r.Provisioner.ResolveImageDigest(ctx, ns, env.Name); err == nil && digest != "" {
+            patch := client.MergeFrom(env.DeepCopy())
+            env.Status.ImageDigest = digest
+            if err := r.Status().Patch(ctx, env, patch); err != nil {
+                return ctrl.Result{}, err
+            }
+        }
+    }
+
+    // No periodic requeue. Hibernation is driven by the lifecycle manager's 60s
+    // tick, not by the reconciler — a RequeueAfter here would duplicate that loop
+    // and double the write rate on every active environment.
+    return ctrl.Result{}, nil
+}
+
 // SetupWithManager registers watches
 func (r *EnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
     return ctrl.NewControllerManagedBy(mgr).
@@ -421,8 +703,12 @@ func (r *EnvironmentReconciler) reconcileProvisioning(ctx context.Context, env *
         expiresAt := metav1.NewTime(now.Time.Add(parseDuration(env.Spec.Lifecycle.TTL)))
         env.Status.ProvisioningStartedAt = &now
         env.Status.ExpiresAt             = &expiresAt
-        env.Status.PreviewURL            = fmt.Sprintf("%s-%s-pr-%d.dev.local",
-            env.Spec.Owner, env.Spec.Repository, env.Spec.PullRequest)
+        // MUST be exactly env.Name + domain. The gateway's hostnameToEnvName strips
+        // the domain suffix and looks up the remainder verbatim as the CRD name, so
+        // any extra component here (owner, branch) makes every preview URL 404.
+        // The domain comes from config — it is never hard-coded in the reconciler,
+        // because the gateway validates against the same configured value.
+        env.Status.PreviewURL = fmt.Sprintf("%s.%s", env.Name, r.Domain)
         if err := r.Status().Update(ctx, env); err != nil {
             return ctrl.Result{}, err
         }
@@ -485,8 +771,18 @@ func (r *EnvironmentReconciler) reconcileProvisioning(ctx context.Context, env *
     }
 
     nowReady := metav1.Now()
-    env.Status.ActiveSince    = &nowReady
+    env.Status.ActiveSince = &nowReady
+    // LastActivityAt is seeded so the lifecycle manager has a reference point. An
+    // environment nobody ever visits still hibernates after the normal idle window,
+    // rather than living until its 72h TTL holding a slot.
     env.Status.LastActivityAt = &nowReady
+
+    // Counted once, on the transition into ACTIVE — guarded because setStatus is a
+    // no-op when the state is unchanged, so a requeue cannot double-count.
+    if env.Status.LifecycleState != v1alpha1.StateActive {
+        metrics.RecordProvisioningDuration("success",
+            time.Since(env.Status.ProvisioningStartedAt.Time))
+    }
 
     return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateActive, "environment ready")
 }
@@ -494,30 +790,373 @@ func (r *EnvironmentReconciler) reconcileProvisioning(ctx context.Context, env *
 
 ### Warm hibernation handler (`pkg/controller/reconcile_hibernation.go`)
 
+Forge hibernates **every workload in the namespace**, not only the Deployment it created. A preview environment for a real application has an API Deployment plus a worker, a cache, and possibly a CronJob; scaling only one of them down leaves most of the reservation in place and makes the whole resource claim false.
+
+**Workload handling matrix:**
+
+| Kind | Warm hibernate | Deep hibernate | Why |
+|---|---|---|---|
+| `Deployment` (Forge-owned) | replicas → 0 | delete | Recreatable from `spec` |
+| `Deployment` (user-created) | replicas → 0 | replicas → 0 only | Spec cannot be reconstructed, so never deleted |
+| `CronJob` | `suspend: true` | `suspend: true` | Suspending stops new runs without losing the schedule |
+| `Job` | untouched | untouched | Killing an in-flight job loses work; jobs are short-lived anyway |
+| `StatefulSet` | untouched, recorded in `UnmanagedWorkloads` | untouched | Needs ordered shutdown and connection draining — out of MVP scope |
+| `DaemonSet` | untouched | untouched | Node-level; replicas are not a meaningful dial |
+| `HorizontalPodAutoscaler` | captured + deleted | captured + deleted | An HPA immediately scales the Deployment back up, defeating hibernation |
+
 ```go
 func (r *EnvironmentReconciler) reconcileWarmHibernated(ctx context.Context, env *v1alpha1.Environment) (ctrl.Result, error) {
-    // Scale Deployment to 0
-    if err := r.Provisioner.EnsureDeployment(ctx, env, nil, 0); err != nil {
+    ns := env.Status.NamespaceName
+
+    // Inventory is taken once, on the transition into hibernation. On a requeue
+    // (partial failure) the existing inventory is reused — re-inventorying a
+    // half-scaled namespace would record OriginalReplicas: 0 and the environment
+    // would restore to zero replicas, permanently dead.
+    if len(env.Status.HibernatedWorkloads) == 0 {
+        inv, unmanaged, err := r.Provisioner.InventoryWorkloads(ctx, ns)
+        if err != nil {
+            return ctrl.Result{}, err
+        }
+        if len(inv) > v1alpha1.MaxHibernatedWorkloads {
+            // Reverting to ACTIVE alone causes a flap loop: the lifecycle manager
+            // re-evaluates every 60s, sees the same idle environment, patches to
+            // WARM_HIBERNATED again, and is refused again — forever. The sticky
+            // HibernationBlocked flag makes the lifecycle manager skip this
+            // environment until the workload count drops.
+            env.Status.HibernationBlocked = true
+            return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateActive,
+                fmt.Sprintf("hibernation blocked: %d workloads exceeds limit of %d",
+                    len(inv), v1alpha1.MaxHibernatedWorkloads))
+        }
+        env.Status.HibernationBlocked = false
+        env.Status.HibernatedWorkloads = inv
+        env.Status.UnmanagedWorkloads  = unmanaged
+        if err := r.Status().Update(ctx, env); err != nil {
+            return ctrl.Result{}, err // conflict → requeued with fresh object
+        }
+    }
+
+    // HPAs are deleted before scaling: if the Deployment is scaled first, the HPA
+    // controller can observe replicas=0 and scale back to minReplicas in the gap.
+    if err := r.Provisioner.CaptureAndDeleteHPAs(ctx, ns, env.Status.HibernatedWorkloads); err != nil {
         return ctrl.Result{}, err
     }
+
+    // Scale everything in parallel. errgroup caps concurrency so a 20-workload
+    // namespace does not open 20 simultaneous API connections.
+    g, gctx := errgroup.WithContext(ctx)
+    g.SetLimit(8)
+    for i := range env.Status.HibernatedWorkloads {
+        w := env.Status.HibernatedWorkloads[i]
+        g.Go(func() error { return r.Provisioner.ScaleWorkload(gctx, ns, w, 0) })
+    }
+    if err := g.Wait(); err != nil {
+        // Idempotent: the next reconcile re-scales whatever is still up.
+        return ctrl.Result{}, err
+    }
+
     metrics.RecordHibernation("warm")
-    return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateWarmHibernated, "scaled to zero")
+    // The slot is freed here, not by the lifecycle manager: the operator is what
+    // actually completed the scale-down, so this is the first moment the capacity
+    // is genuinely available to something else.
+    r.CapacityWorker.Release(env.Name)
+    return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateWarmHibernated,
+        fmt.Sprintf("%d workloads scaled to zero", len(env.Status.HibernatedWorkloads)))
 }
 
 func (r *EnvironmentReconciler) reconcileDeepHibernated(ctx context.Context, env *v1alpha1.Environment) (ctrl.Result, error) {
     ns := env.Status.NamespaceName
 
-    // Delete Deployment and Service in parallel (namespace + quota retained)
+    // Deep hibernation can be entered directly from ACTIVE (e.g. capacity eviction
+    // of a low-priority environment), so the inventory may not exist yet.
+    if len(env.Status.HibernatedWorkloads) == 0 {
+        inv, unmanaged, err := r.Provisioner.InventoryWorkloads(ctx, ns)
+        if err != nil {
+            return ctrl.Result{}, err
+        }
+        env.Status.HibernatedWorkloads = inv
+        env.Status.UnmanagedWorkloads  = unmanaged
+        if err := r.Status().Update(ctx, env); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
+    if err := r.Provisioner.CaptureAndDeleteHPAs(ctx, ns, env.Status.HibernatedWorkloads); err != nil {
+        return ctrl.Result{}, err
+    }
+
     g, gctx := errgroup.WithContext(ctx)
-    g.Go(func() error { return r.Provisioner.DeleteDeployment(gctx, env, ns) })
+    g.SetLimit(8)
+    for i := range env.Status.HibernatedWorkloads {
+        w := env.Status.HibernatedWorkloads[i]
+        g.Go(func() error {
+            if w.ForgeOwned {
+                // Only Forge-created workloads are deleted — they are rebuilt from
+                // env.Spec on restore. A user-created Deployment has no stored spec,
+                // so deleting it would be unrecoverable; it is scaled to zero instead.
+                return r.Provisioner.DeleteWorkload(gctx, ns, w)
+            }
+            return r.Provisioner.ScaleWorkload(gctx, ns, w, 0)
+        })
+    }
+    // Services are deleted only if Forge owns them; the Ingress stays so the
+    // hostname keeps resolving to the gateway while the environment sleeps.
     g.Go(func() error { return r.Provisioner.DeleteService(gctx, env, ns) })
     if err := g.Wait(); err != nil {
         return ctrl.Result{}, err
     }
+
     metrics.RecordHibernation("deep")
-    return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateDeepHibernated, "deployment and service removed; metadata retained")
+    r.CapacityWorker.Release(env.Name)
+    return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateDeepHibernated,
+        "forge-owned workloads removed; metadata and inventory retained")
 }
 ```
+
+**Why the Ingress is never deleted:** the gateway routes by hostname. If the Ingress disappears during deep hibernation the hostname stops resolving and the wake-up request never reaches the gateway — the environment becomes permanently unreachable. The Ingress points at the gateway Service, not at the app, so it costs nothing to keep.
+
+**Workload inventory (`pkg/provisioner/workloads.go`):**
+
+```go
+// InventoryWorkloads lists every workload in the namespace and classifies it.
+// Returns the hibernatable set and the names of workloads Forge will not touch.
+func (p *Provisioner) InventoryWorkloads(ctx context.Context, ns string) ([]v1alpha1.HibernatedWorkload, []string, error) {
+    var out []v1alpha1.HibernatedWorkload
+    var unmanaged []string
+
+    var deps appsv1.DeploymentList
+    if err := p.client.List(ctx, &deps, client.InNamespace(ns)); err != nil {
+        return nil, nil, err
+    }
+    for _, d := range deps.Items {
+        replicas := int32(1)
+        if d.Spec.Replicas != nil {
+            replicas = *d.Spec.Replicas
+        }
+        // A Deployment already at zero is skipped: recording OriginalReplicas: 0
+        // would restore it to zero and the environment would never come back.
+        if replicas == 0 {
+            continue
+        }
+        out = append(out, v1alpha1.HibernatedWorkload{
+            Kind:             "Deployment",
+            Name:             d.Name,
+            OriginalReplicas: replicas,
+            ForgeOwned:       d.Labels[v1alpha1.ForgeOwnedLabel] == "true",
+        })
+    }
+
+    var crons batchv1.CronJobList
+    if err := p.client.List(ctx, &crons, client.InNamespace(ns)); err != nil {
+        return nil, nil, err
+    }
+    for _, c := range crons.Items {
+        if c.Spec.Suspend != nil && *c.Spec.Suspend {
+            continue // already suspended by the user — leave it that way on restore
+        }
+        // OriginalReplicas is 1 as a sentinel meaning "was running". CronJobs have
+        // no replica count; leaving it 0 would make a replica-based restore path
+        // treat the CronJob as "should be zero" and re-suspend it on every wake.
+        // The restore path dispatches on Kind, so this value is only a safety net.
+        out = append(out, v1alpha1.HibernatedWorkload{Kind: "CronJob", Name: c.Name, OriginalReplicas: 1})
+    }
+
+    // StatefulSets and DaemonSets are recorded but not hibernated, so a partially
+    // hibernated environment is visible in `kubectl describe` rather than silently
+    // continuing to consume its reservation.
+    var sts appsv1.StatefulSetList
+    if err := p.client.List(ctx, &sts, client.InNamespace(ns)); err != nil {
+        return nil, nil, err
+    }
+    for _, s := range sts.Items {
+        unmanaged = append(unmanaged, "StatefulSet/"+s.Name)
+    }
+    return out, unmanaged, nil
+}
+```
+
+### Workload dispatch methods (`pkg/provisioner/workloads.go`)
+
+Every workload operation dispatches on `Kind`. A single replica-based code path is wrong because a CronJob has no replicas — routing it through one re-suspends it on every restore.
+
+```go
+// ScaleWorkload sets a workload to the given replica count. Used for both
+// hibernation (replicas=0) and restoration (replicas=OriginalReplicas) of
+// workloads Forge does not own and therefore never deletes.
+func (p *Provisioner) ScaleWorkload(ctx context.Context, ns string, w v1alpha1.HibernatedWorkload, replicas int32) error {
+    switch w.Kind {
+    case "Deployment":
+        var d appsv1.Deployment
+        if err := p.client.Get(ctx, client.ObjectKey{Namespace: ns, Name: w.Name}, &d); err != nil {
+            // A workload deleted out from under us is not an error during
+            // hibernation — there is nothing left to scale down.
+            return client.IgnoreNotFound(err)
+        }
+        if d.Spec.Replicas != nil && *d.Spec.Replicas == replicas {
+            return nil // already at target; avoids a pointless write and watch event
+        }
+        patch := client.MergeFrom(d.DeepCopy())
+        d.Spec.Replicas = &replicas
+        return p.client.Patch(ctx, &d, patch)
+
+    case "CronJob":
+        // Suspension, not scaling. replicas==0 means suspend, anything else resume.
+        return p.SuspendCronJob(ctx, ns, w.Name, replicas == 0)
+
+    default:
+        return fmt.Errorf("unsupported workload kind %q", w.Kind)
+    }
+}
+
+func (p *Provisioner) SuspendCronJob(ctx context.Context, ns, name string, suspend bool) error {
+    var c batchv1.CronJob
+    if err := p.client.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &c); err != nil {
+        return client.IgnoreNotFound(err)
+    }
+    if c.Spec.Suspend != nil && *c.Spec.Suspend == suspend {
+        return nil
+    }
+    patch := client.MergeFrom(c.DeepCopy())
+    c.Spec.Suspend = &suspend
+    return p.client.Patch(ctx, &c, patch)
+}
+
+// EnsureWorkload recreates a Forge-owned workload from env.Spec after deep
+// hibernation deleted it, or scales it back up after warm hibernation.
+// It delegates to the same EnsureDeployment used during provisioning, so there is
+// exactly one place that knows how to build the pod spec.
+func (p *Provisioner) EnsureWorkload(ctx context.Context, env *v1alpha1.Environment, ns string, w v1alpha1.HibernatedWorkload, replicas int32) error {
+    switch w.Kind {
+    case "Deployment":
+        return p.EnsureDeployment(ctx, env, ns, replicas)
+    case "CronJob":
+        return p.SuspendCronJob(ctx, ns, w.Name, false)
+    default:
+        return fmt.Errorf("unsupported workload kind %q", w.Kind)
+    }
+}
+
+// DeleteWorkload removes a Forge-owned workload during deep hibernation.
+func (p *Provisioner) DeleteWorkload(ctx context.Context, ns string, w v1alpha1.HibernatedWorkload) error {
+    switch w.Kind {
+    case "Deployment":
+        d := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: w.Name}}
+        return client.IgnoreNotFound(p.client.Delete(ctx, d))
+    case "CronJob":
+        // CronJobs are never deleted — suspending already frees all resources and
+        // preserves the schedule, which cannot be reconstructed from env.Spec.
+        return p.SuspendCronJob(ctx, ns, w.Name, true)
+    default:
+        return fmt.Errorf("unsupported workload kind %q", w.Kind)
+    }
+}
+
+// AreWorkloadsReady reports whether every workload has reached its target.
+// Returns the names of those that have not, so the status message can name the
+// specific blocker instead of a generic "waiting".
+func (p *Provisioner) AreWorkloadsReady(ctx context.Context, ns string, ws []v1alpha1.HibernatedWorkload) (bool, []string, error) {
+    var notReady []string
+    for _, w := range ws {
+        if w.Kind != "Deployment" {
+            continue // a suspended CronJob has no readiness concept
+        }
+        var d appsv1.Deployment
+        if err := p.client.Get(ctx, client.ObjectKey{Namespace: ns, Name: w.Name}, &d); err != nil {
+            if apierrors.IsNotFound(err) {
+                notReady = append(notReady, w.Name+" (not created yet)")
+                continue
+            }
+            return false, nil, err
+        }
+        // ReadyReplicas, not AvailableReplicas or Replicas: a Pod can be Running
+        // without having passed its readiness probe, and forwarding to it 502s.
+        if d.Status.ReadyReplicas < w.OriginalReplicas {
+            notReady = append(notReady,
+                fmt.Sprintf("%s (%d/%d ready)", w.Name, d.Status.ReadyReplicas, w.OriginalReplicas))
+        }
+    }
+    return len(notReady) == 0, notReady, nil
+}
+
+// CaptureAndDeleteHPAs serialises any HPA targeting a hibernated workload into
+// the CRD status, then deletes it.
+//
+// Deleting is not optional. An HPA left in place observes replicas=0, compares it
+// against minReplicas, and scales the Deployment straight back up — hibernation
+// would last a few seconds and then silently undo itself.
+func (p *Provisioner) CaptureAndDeleteHPAs(ctx context.Context, ns string, ws []v1alpha1.HibernatedWorkload) error {
+    var hpas autoscalingv2.HorizontalPodAutoscalerList
+    if err := p.client.List(ctx, &hpas, client.InNamespace(ns)); err != nil {
+        return err
+    }
+    for i := range ws {
+        for j := range hpas.Items {
+            h := &hpas.Items[j]
+            if h.Spec.ScaleTargetRef.Kind != ws[i].Kind || h.Spec.ScaleTargetRef.Name != ws[i].Name {
+                continue
+            }
+            // Idempotent: on a requeue the spec is already captured, so do not
+            // overwrite it with a second read of an HPA that may already be gone.
+            if ws[i].HPASpec == "" {
+                raw, err := json.Marshal(h.Spec)
+                if err != nil {
+                    return err
+                }
+                ws[i].HPAName = h.Name
+                ws[i].HPASpec = string(raw)
+            }
+            if err := client.IgnoreNotFound(p.client.Delete(ctx, h)); err != nil {
+                return err
+            }
+        }
+    }
+    return nil
+}
+
+// RestoreHPAs recreates captured HPAs. Called only AFTER the workloads exist —
+// an HPA with a dangling scaleTargetRef makes the HPA controller back off and log
+// errors until the target appears.
+func (p *Provisioner) RestoreHPAs(ctx context.Context, ns string, ws []v1alpha1.HibernatedWorkload) error {
+    for _, w := range ws {
+        if w.HPAName == "" || w.HPASpec == "" {
+            continue
+        }
+        var spec autoscalingv2.HorizontalPodAutoscalerSpec
+        if err := json.Unmarshal([]byte(w.HPASpec), &spec); err != nil {
+            return err
+        }
+        h := &autoscalingv2.HorizontalPodAutoscaler{
+            ObjectMeta: metav1.ObjectMeta{Name: w.HPAName, Namespace: ns},
+        }
+        if _, err := ctrl.CreateOrUpdate(ctx, p.client, h, func() error {
+            h.Spec = spec
+            return nil
+        }); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+**Note on `CaptureAndDeleteHPAs` mutating `ws`:** it writes `HPAName`/`HPASpec` into the slice elements, so the caller must persist `env.Status.HibernatedWorkloads` after calling it. Both hibernation handlers do this via the `setStatus` call at the end of the handler, which writes the whole status including the mutated inventory.
+
+**Edge cases this design handles:**
+
+| Case | Behaviour |
+|---|---|
+| Deployment has `replicas: 3` | Restored to 3, not 1 — `OriginalReplicas` is captured |
+| CronJob in namespace | Suspended on hibernate, unsuspended on restore — never routed through the replica path |
+| CronJob already suspended by the user | Skipped from inventory, stays suspended after restore |
+| Workload deleted externally mid-hibernation | `IgnoreNotFound` — nothing to scale, not an error |
+| Workload already at target replicas | Early return, no write, no spurious watch event |
+| Deployment already at `replicas: 0` | Skipped from inventory, so restore does not set it to 0 |
+| HPA targeting a hibernated Deployment | HPA deleted before scaling, recreated from `HPASpec` on restore |
+| Reconcile crashes halfway through scaling | Inventory already persisted; next reconcile re-scales the remainder |
+| Re-entering hibernation while partly scaled | Inventory is not recomputed (guarded by `len(...) == 0`) |
+| StatefulSet in namespace | Listed in `UnmanagedWorkloads`, keeps running, surfaced in status |
+| Running Job | Untouched — killing it loses work |
+| More than 20 workloads | Hibernation refused, environment stays ACTIVE with an explanatory message |
+| User adds a Deployment while hibernated | Next reconcile of the hibernated state scales it to zero and appends it to the inventory |
 
 ### Restoration handler (`pkg/controller/reconcile_restoring.go`)
 
@@ -542,37 +1181,78 @@ func (r *EnvironmentReconciler) reconcileRestoring(ctx context.Context, env *v1a
             fmt.Sprintf("timed out (attempt %d)", env.Status.RestorationAttempts))
     }
 
-    // Recreate resources in parallel where possible
+    // Restore every workload captured at hibernation time, in parallel, to its
+    // ORIGINAL replica count. Deep hibernation deleted the Forge-owned ones, so
+    // those are recreated from spec; the rest are scaled back up.
     g, gctx := errgroup.WithContext(ctx)
-    g.Go(func() error { return r.Provisioner.EnsureDeployment(gctx, env, ns, 1) })
+    g.SetLimit(8)
+    for i := range env.Status.HibernatedWorkloads {
+        w := env.Status.HibernatedWorkloads[i]
+        g.Go(func() error {
+            if w.ForgeOwned {
+                // EnsureWorkload is create-or-update, so this is correct whether the
+                // workload was deleted (deep) or merely scaled to zero (warm).
+                return r.Provisioner.EnsureWorkload(gctx, env, ns, w, w.OriginalReplicas)
+            }
+            return r.Provisioner.ScaleWorkload(gctx, ns, w, w.OriginalReplicas)
+        })
+    }
     g.Go(func() error { return r.Provisioner.EnsureService(gctx, env, ns) })
     if err := g.Wait(); err != nil {
         return ctrl.Result{}, err
     }
 
-    // Check readiness
-    ready, err := r.Provisioner.IsDeploymentReady(ctx, ns, env.Name)
+    // HPAs are recreated only after the workloads exist, otherwise the HPA
+    // controller logs a dangling scaleTargetRef and backs off.
+    if err := r.Provisioner.RestoreHPAs(ctx, ns, env.Status.HibernatedWorkloads); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // Every workload must be Ready, not just the primary one. The slowest workload
+    // determines the restore time; they start in parallel so this is max(), not sum().
+    ready, notReady, err := r.Provisioner.AreWorkloadsReady(ctx, ns, env.Status.HibernatedWorkloads)
     if err != nil {
         return ctrl.Result{}, err
     }
     if !ready {
-        return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+        // Requeue message names the blocking workload so a stuck restore is
+        // diagnosable from `kubectl get env` without reading operator logs.
+        return ctrl.Result{RequeueAfter: 2 * time.Second},
+            r.setStatusMessageOnly(ctx, env, "waiting for "+strings.Join(notReady, ", "))
     }
 
-    // Measure duration before setting RestoredAt
+    // Measure duration BEFORE setting RestoredAt — reading time.Since(RestoredAt)
+    // after assigning it always yields ~0.
     duration := time.Since(env.Status.RestorationStartedAt.Time)
+    from := "warm"
+    if env.Status.LifecycleState == v1alpha1.StateDeepHibernated {
+        from = "deep"
+    }
 
     now := metav1.Now()
-    env.Status.RestoredAt         = &now
-    env.Status.LastActivityAt     = &now  // reset — prevents immediate re-hibernation
-    env.Status.RestorationAttempts = 0
-    env.Status.LastFailureReason  = ""
+    env.Status.RestoredAt           = &now
+    env.Status.LastActivityAt       = &now // reset — prevents immediate re-hibernation
+    env.Status.RestorationAttempts  = 0
+    env.Status.LastFailureReason    = ""
     env.Status.RestorationStartedAt = nil // cleared on success
+    // Inventory is NOT cleared here — reconcileActive clears it on the next pass.
+    // It must survive until the environment is confirmed ACTIVE, because a requeue
+    // during restoration still needs the original replica counts. Clearing it in
+    // reconcileActive rather than retaining it indefinitely is what prevents the
+    // counts going stale when a user rescales their own Deployment afterwards.
 
-    metrics.RecordRestoration(env.Name, duration)
-    return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateActive, "restored")
+    // Labels are bounded (warm|deep × success|timeout). env.Name must NEVER be a
+    // label — that is one time series per PR and will degrade Prometheus.
+    metrics.RecordRestoration(from, "success", duration)
+    // Deliberately NOT recording a predictive counter here. The hit/miss outcome is
+    // recorded exactly once, by the lifecycle manager, once it can see whether real
+    // traffic arrived before PredictiveWakeTTL expired. Incrementing here as well
+    // would make one predictive wake produce three increments across two metrics.
+    return ctrl.Result{}, r.setStatus(ctx, env, v1alpha1.StateActive, "restored "+from)
 }
 ```
+
+**Restore ordering limitation (documented, not solved in MVP):** all workloads are restored in parallel. If an API Deployment starts before the cache Deployment it depends on, it crash-loops until the dependency is Ready, then recovers via Kubernetes restart backoff. This is correct but adds a few seconds. Dependency-ordered restore (via a `forge.dev/depends-on` annotation) is deliberately deferred — it is additive and does not change any schema already defined here.
 
 ### Restoration failure handler (`pkg/controller/reconcile_restoring.go`)
 
@@ -586,8 +1266,11 @@ func (r *EnvironmentReconciler) reconcileRestorationFailed(ctx context.Context, 
         // RESTORING to trigger a fresh attempt, so this is not permanently stuck.
         return ctrl.Result{}, nil
     }
-    // Exponential backoff before retry: 30s, 60s, 120s
-    backoff := time.Duration(env.Status.RestorationAttempts*env.Status.RestorationAttempts) * 30 * time.Second
+    // Exponential backoff before retry: 30s, 60s, 120s.
+    // Must be 2^(n-1)*30s. A naive n*n*30s yields 30s/120s/270s, which does not
+    // match the documented schedule and leaves an environment dark far longer
+    // than intended on the second retry.
+    backoff := time.Duration(1<<uint(env.Status.RestorationAttempts-1)) * 30 * time.Second
     // Reset to RESTORING — the restoration handler will start a new attempt.
     env.Status.RestorationStartedAt = nil
     return ctrl.Result{RequeueAfter: backoff}, r.setStatus(ctx, env, v1alpha1.StateRestoring,
@@ -612,26 +1295,104 @@ func (r *EnvironmentReconciler) reconcileTerminating(ctx context.Context, env *v
         nsObj := &corev1.Namespace{}
         err := r.Get(ctx, types.NamespacedName{Name: ns}, nsObj)
         if err == nil || !apierrors.IsNotFound(err) {
-            // Namespace still exists (or error reading it) — wait
+            // Namespace still exists (or error reading it) — wait.
+            //
+            // Bounded wait: a finalizer on some resource inside the namespace can
+            // block deletion indefinitely. After 5 minutes the condition is
+            // surfaced rather than requeued silently forever, so the operator does
+            // not look healthy while leaking a namespace.
+            if env.DeletionTimestamp != nil &&
+                time.Since(env.DeletionTimestamp.Time) > 5*time.Minute {
+                return ctrl.Result{RequeueAfter: 30 * time.Second},
+                    r.setStatusMessageOnly(ctx, env,
+                        "namespace "+ns+" stuck terminating for >5m; check for finalizers on resources inside it")
+            }
             return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
         }
     }
 
+    // Capacity is freed and the termination counted exactly here — at the point the
+    // namespace is confirmed gone, not when deletion was requested. Counting at
+    // request time would over-report on every requeue of this handler.
+    metrics.RecordTermination(terminationReason(env))
+    r.CapacityWorker.Release(env.Name)
+
     // Remove finalizer so Kubernetes deletes the CRD object
     controllerutil.RemoveFinalizer(env, forgeFinalizer)
     return ctrl.Result{}, r.Update(ctx, env)
+}
+
+// terminationReason maps to the bounded metric label set (ttl|pr_closed|manual).
+// It reads ExpiresAt rather than a stored reason so no extra status field is
+// needed: an environment past its expiry was terminated by TTL.
+func terminationReason(env *v1alpha1.Environment) string {
+    if env.Status.ExpiresAt != nil && time.Now().After(env.Status.ExpiresAt.Time) {
+        return "ttl"
+    }
+    if env.Status.Message == "PR closed" {
+        return "pr_closed"
+    }
+    return "manual"
 }
 ```
 
 ### Status helper
 
 ```go
-func (r *EnvironmentReconciler) setStatus(ctx context.Context, env *v1alpha1.Environment, state v1alpha1.LifecycleState, msg string) error {
-    env.Status.LifecycleState      = state
-    env.Status.Message             = msg
-    env.Status.ObservedGeneration  = env.Generation
+// The equality guard is load-bearing, not an optimisation. Both hibernation
+// handlers call setStatus with an unchanged state on every requeue. Without the
+// guard each call writes the status subresource, which fires a watch event, which
+// re-reconciles, which calls setStatus again — a tight loop that pins a core.
+func (r *EnvironmentReconciler) setStatus(ctx context.Context, env *v1alpha1.Environment,
+    state v1alpha1.LifecycleState, msg string) error {
+
+    if env.Status.LifecycleState == state &&
+        env.Status.Message == msg &&
+        env.Status.ObservedGeneration == env.Generation {
+        return nil
+    }
+    env.Status.LifecycleState     = state
+    env.Status.Message            = msg
+    env.Status.ObservedGeneration = env.Generation
     return r.Status().Update(ctx, env)
 }
+
+// setStatusMessageOnly updates the message without touching lifecycleState. Used
+// by the restoration handler to report which workload is blocking, which changes
+// on almost every requeue while the state stays RESTORING.
+func (r *EnvironmentReconciler) setStatusMessageOnly(ctx context.Context,
+    env *v1alpha1.Environment, msg string) error {
+
+    if env.Status.Message == msg {
+        return nil
+    }
+    env.Status.Message = msg
+    return r.Status().Update(ctx, env)
+}
+
+// setFailure records the cause alongside a failure state and emits the matching
+// counter. The counter is incremented here, and only here, so it can never be
+// double-counted by a requeue that re-enters the same failed state.
+func (r *EnvironmentReconciler) setFailure(ctx context.Context, env *v1alpha1.Environment,
+    state v1alpha1.LifecycleState, cause error) error {
+
+    if env.Status.LifecycleState == state {
+        return nil // already recorded; do not increment again
+    }
+    env.Status.LastFailureReason = cause.Error()
+    switch state {
+    case v1alpha1.StateProvisioningFailed:
+        metrics.RecordProvisioningFailure(classifyFailure(cause))
+    case v1alpha1.StateRestorationFailed:
+        metrics.RecordRestorationFailure(classifyFailure(cause))
+    }
+    return r.setStatus(ctx, env, state, cause.Error())
+}
+
+// classifyFailure maps an error to one of the bounded metric label values
+// (timeout|image_pull|quota|other). Returning the raw error string as a label
+// would be unbounded cardinality.
+func classifyFailure(err error) string
 ```
 
 ---
@@ -689,9 +1450,42 @@ func (m *Manager) evaluateOne(ctx context.Context, env *v1alpha1.Environment) {
         return
     }
 
-    // Skip if pinned (via flag or priority)
-    if env.Spec.Lifecycle.Pinned || env.Spec.Lifecycle.Priority == "pinned" {
+    // Pinned is expressed solely through Priority. There is no separate Pinned
+    // bool — two sources of truth for the same decision drift apart.
+    if env.Spec.Lifecycle.Priority == "pinned" {
         return
+    }
+
+    // The operator already refused to hibernate this environment. Re-requesting
+    // every tick would flap it between ACTIVE and WARM_HIBERNATED indefinitely.
+    if env.Status.HibernationBlocked {
+        return
+    }
+
+    // A predictive wake is speculative: it must not hold a slot for the full
+    // inactivity window if the reviewer never arrived. This branch runs BEFORE
+    // the grace period check, because the grace period (2m) would otherwise mask
+    // a shorter PredictiveWakeTTL.
+    if env.Status.RestorationTrigger == v1alpha1.TriggerPredictive && env.Status.RestoredAt != nil {
+        arrived := env.Status.LastActivityAt != nil &&
+            env.Status.LastActivityAt.Time.After(env.Status.RestoredAt.Time)
+        if arrived {
+            // The prediction was correct. Clear the trigger so normal timeouts
+            // resume, and count the hit exactly once.
+            metrics.RecordPredictiveWake("hit")
+            m.clearPredictiveTrigger(ctx, env)
+            // Fall through to the normal inactivity evaluation below.
+        } else {
+            ttl := parseDuration(env.Spec.Lifecycle.PredictiveWakeTTL)
+            if now.Sub(env.Status.RestoredAt.Time) > ttl {
+                metrics.RecordPredictiveWake("miss")
+                m.patchState(ctx, env, v1alpha1.StateWarmHibernated,
+                    "predictive wake expired with no traffic")
+            }
+            // Either way, a predictive wake with no traffic yet is not evaluated
+            // against the normal thresholds.
+            return
+        }
     }
 
     // Skip if within grace period after last restore
@@ -699,11 +1493,19 @@ func (m *Manager) evaluateOne(ctx context.Context, env *v1alpha1.Environment) {
         return
     }
 
-    if env.Status.LastActivityAt == nil {
+    // An environment that has never been visited still has no LastActivityAt.
+    // Falling back to ActiveSince prevents it from living forever: without this,
+    // a PR nobody opens stays ACTIVE until its 72h TTL, holding a slot the whole
+    // time — exactly the waste Forge exists to eliminate.
+    lastSeen := env.Status.ActiveSince
+    if env.Status.LastActivityAt != nil {
+        lastSeen = env.Status.LastActivityAt
+    }
+    if lastSeen == nil {
         return
     }
 
-    idle := now.Sub(env.Status.LastActivityAt.Time)
+    idle := now.Sub(lastSeen.Time)
     warmAfter, deepAfter := hibernationThresholds(env.Spec.Lifecycle)
 
     switch {
@@ -712,6 +1514,12 @@ func (m *Manager) evaluateOne(ctx context.Context, env *v1alpha1.Environment) {
     case idle > warmAfter:
         m.patchState(ctx, env, v1alpha1.StateWarmHibernated, "idle beyond warm-hibernate threshold")
     }
+}
+
+func (m *Manager) clearPredictiveTrigger(ctx context.Context, env *v1alpha1.Environment) {
+    patch := client.MergeFrom(env.DeepCopy())
+    env.Status.RestorationTrigger = v1alpha1.TriggerReactive
+    m.client.Status().Patch(ctx, env, patch)
 }
 
 // hibernationThresholds returns warm and deep thresholds for the environment's priority.
@@ -743,6 +1551,56 @@ func (m *Manager) patchState(ctx context.Context, env *v1alpha1.Environment, sta
 
 ## 5. Provisioner — Resource Creation Order
 
+### Type and constructor (`pkg/provisioner/provisioner.go`)
+
+```go
+// Provisioner owns all Kubernetes object creation. It is stateless apart from
+// config, so it is safe to share one instance across reconciles.
+type Provisioner struct {
+    client client.Client
+    // gatewayNamespace is needed by the NetworkPolicy builder: the allow-ingress
+    // rule must name the namespace the gateway runs in, or default-deny blocks
+    // the gateway and every environment is isolated into uselessness.
+    gatewayNamespace string
+    // registry is the address Minikube pulls from. It is "host.minikube.internal:5000",
+    // NOT "localhost:5000" — localhost inside the Minikube VM is the VM itself.
+    registry string
+}
+
+func New(c client.Client, gatewayNamespace, registry string) *Provisioner {
+    return &Provisioner{client: c, gatewayNamespace: gatewayNamespace, registry: registry}
+}
+```
+
+Every method takes the namespace as a `string`, never a `*corev1.Namespace`, so callers can pass `ns.Name` uniformly. Full method set:
+
+```go
+// Namespace and governance
+func (p *Provisioner) EnsureNamespace(ctx context.Context, env *v1alpha1.Environment) (*corev1.Namespace, error)
+func (p *Provisioner) DeleteNamespace(ctx context.Context, nsName string) error
+func (p *Provisioner) NamespaceExists(ctx context.Context, nsName string) (bool, error)
+func (p *Provisioner) EnsureResourceQuota(ctx context.Context, env *v1alpha1.Environment, nsName string) error
+func (p *Provisioner) EnsureNetworkPolicies(ctx context.Context, env *v1alpha1.Environment, nsName string) error
+
+// Workloads — see "Workload dispatch methods" below for the generic Kind-based set
+func (p *Provisioner) EnsureDeployment(ctx context.Context, env *v1alpha1.Environment, nsName string, replicas int32) error
+func (p *Provisioner) EnsureService(ctx context.Context, env *v1alpha1.Environment, nsName string) error
+func (p *Provisioner) DeleteService(ctx context.Context, env *v1alpha1.Environment, nsName string) error
+func (p *Provisioner) EnsureIngress(ctx context.Context, env *v1alpha1.Environment, nsName string) error
+
+// IsDeploymentReady checks only the primary Deployment (name == env.Name). The
+// multi-workload equivalent is AreWorkloadsReady; this one is used during
+// PROVISIONING, before any inventory exists.
+func (p *Provisioner) IsDeploymentReady(ctx context.Context, nsName, name string) (bool, error)
+
+// ResolveImageDigest reads the running Pod's containerStatuses[].imageID to
+// capture the immutable digest the node actually pulled. Returns "" (not an
+// error) when no Pod is ready yet — the caller retries on the next reconcile.
+func (p *Provisioner) ResolveImageDigest(ctx context.Context, nsName, name string) (string, error)
+```
+
+`ResolveImageDigest` reads from the Pod rather than querying the registry because the Pod's `imageID` is ground truth about what is *running*; a registry query would report what the tag points to *now*, which may already have moved.
+
 ### Namespace provisioner (`pkg/provisioner/namespace.go`)
 
 ```go
@@ -770,11 +1628,14 @@ func (p *Provisioner) EnsureNamespace(ctx context.Context, env *v1alpha1.Environ
 ### NetworkPolicy provisioner (`pkg/provisioner/namespace.go`)
 
 ```go
-func (p *Provisioner) EnsureNetworkPolicies(ctx context.Context, env *v1alpha1.Environment, ns *corev1.Namespace) error {
+// nsName, not *corev1.Namespace — every provisioner method takes the namespace
+// name as a string so callers can pass ns.Name uniformly without threading the
+// whole object through.
+func (p *Provisioner) EnsureNetworkPolicies(ctx context.Context, env *v1alpha1.Environment, nsName string) error {
     policies := []*networkingv1.NetworkPolicy{
-        defaultDenyPolicy(ns.Name),
-        allowGatewayIngressPolicy(ns.Name, p.gatewayNamespace),
-        allowDNSEgressPolicy(ns.Name),
+        defaultDenyPolicy(nsName),
+        allowGatewayIngressPolicy(nsName, p.gatewayNamespace),
+        allowDNSEgressPolicy(nsName),
     }
     for _, pol := range policies {
         if _, err := ctrl.CreateOrUpdate(ctx, p.client, pol, func() error { return nil }); err != nil {
@@ -829,18 +1690,26 @@ func (p *Provisioner) EnsureDeployment(ctx context.Context, env *v1alpha1.Enviro
     // Use immutable digest when available; fall back to mutable tag only on first deploy.
     var image string
     if env.Status.ImageDigest != "" {
-        image = fmt.Sprintf("host.minikube.internal:5000/%s@%s",
-            env.Spec.Image.Repository, env.Status.ImageDigest)
+        image = fmt.Sprintf("%s/%s@%s",
+            p.registry, env.Spec.Image.Repository, env.Status.ImageDigest)
     } else {
-        image = fmt.Sprintf("host.minikube.internal:5000/%s:%s",
-            env.Spec.Image.Repository, env.Spec.Image.Tag)
+        image = fmt.Sprintf("%s/%s:%s",
+            p.registry, env.Spec.Image.Repository, env.Spec.Image.Tag)
     }
 
     dep := &appsv1.Deployment{
         ObjectMeta: metav1.ObjectMeta{
             Name:      env.Name,
             Namespace: nsName,
-            Labels:    map[string]string{v1alpha1.ForgeLabel: env.Name},
+            Labels: map[string]string{
+                v1alpha1.ForgeLabel: env.Name,
+                // ForgeOwnedLabel is what InventoryWorkloads reads to decide whether
+                // deep hibernation may DELETE a workload (recreatable from spec) or
+                // may only scale it to zero. Omitting it makes Forge's own Deployment
+                // classify as user-owned, so deep hibernation silently degrades to
+                // warm and the two-level feature does nothing at all.
+                v1alpha1.ForgeOwnedLabel: "true",
+            },
         },
     }
     _, err := ctrl.CreateOrUpdate(ctx, p.client, dep, func() error {
@@ -892,9 +1761,22 @@ func (p *Provisioner) EnsureDeployment(ctx context.Context, env *v1alpha1.Enviro
                                     Port: intstr.FromInt32(env.Spec.Image.Port),
                                 },
                             },
-                            InitialDelaySeconds: 2,
-                            PeriodSeconds:       3,
-                            FailureThreshold:    10,
+                            // Tight on purpose. The readiness probe — not image pull
+                            // and not object creation — is the dominant term in wake
+                            // latency. Kubernetes' defaults (initialDelay 0,
+                            // period 10) mark a Pod Ready up to 10s after the app is
+                            // actually serving, because the first probe fires before
+                            // the app binds and the second waits a full period.
+                            // 1s/1s makes Ready track actual readiness to within ~1s.
+                            // This is the single largest lever Forge has over wake
+                            // time, and it is only available because Forge is the one
+                            // creating the Deployment.
+                            InitialDelaySeconds: 1,
+                            PeriodSeconds:       1,
+                            // 1s period × 30 = 30s of grace for a slow-starting app
+                            // before the Pod is considered broken. The operator's own
+                            // 60s restoration timeout is the outer bound.
+                            FailureThreshold: 30,
                         },
                         LivenessProbe: &corev1.Probe{
                             ProbeHandler: corev1.ProbeHandler{
@@ -945,13 +1827,71 @@ func NewEnvironmentCache(cfg *rest.Config, scheme *runtime.Scheme) (cache.Cache,
     return c, nil
 }
 
-func GetEnvironmentState(cache cache.Cache, envName string) (v1alpha1.LifecycleState, error) {
+// GetEnvironment returns the full object from the informer cache. The handler
+// needs more than the state — spec.drift and status.drift drive policy
+// enforcement, status.namespaceName drives the proxy target. This is an in-memory
+// read, so fetching the whole object costs no more than fetching one field.
+func GetEnvironment(c cache.Cache, envName string) (*v1alpha1.Environment, error) {
     env := &v1alpha1.Environment{}
-    if err := cache.Get(context.Background(), types.NamespacedName{Name: envName}, env); err != nil {
+    if err := c.Get(context.Background(), types.NamespacedName{Name: envName}, env); err != nil {
+        return nil, err
+    }
+    return env, nil
+}
+
+// GetEnvironmentState is retained only for the restoration poll loop, which cares
+// about nothing but the state transition.
+func GetEnvironmentState(c cache.Cache, envName string) (v1alpha1.LifecycleState, error) {
+    env, err := GetEnvironment(c, envName)
+    if err != nil {
         return "", err
     }
     return env.Status.LifecycleState, nil
 }
+
+// recordActivity patches Status.LastActivityAt, debounced per environment.
+//
+// Debouncing is mandatory, not an optimisation: one page load pulls dozens of
+// assets through the gateway, and writing the status subresource per asset turns
+// etcd write throughput into the request-path bottleneck. The 10s window means an
+// idle environment's LastActivityAt is accurate to within 10s, which is far finer
+// than the 60s lifecycle tick that reads it.
+func (h *Handler) recordActivity(envName string) {
+    h.activityMu.Lock()
+    last, seen := h.lastActivityWrite[envName]
+    if seen && time.Since(last) < 10*time.Second {
+        h.activityMu.Unlock()
+        return
+    }
+    h.lastActivityWrite[envName] = time.Now()
+    h.activityMu.Unlock()
+
+    // Fire and forget on a background context — the request must not block on, or
+    // fail because of, an activity bookkeeping write.
+    go func() {
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+        env, err := GetEnvironment(h.envCache, envName)
+        if err != nil {
+            return
+        }
+        patch := client.MergeFrom(env.DeepCopy())
+        now := metav1.Now()
+        env.Status.LastActivityAt = &now
+        _ = h.statusClient.Status().Patch(ctx, env, patch)
+    }()
+}
+```
+
+The debounce map and its mutex are fields on `Handler`:
+
+```go
+    activityMu        sync.Mutex
+    lastActivityWrite map[string]time.Time
+    // statusClient is a writing client. The informer cache is read-only, so the
+    // gateway needs a separate client for its one permitted write
+    // (status.lastActivityAt). Its RBAC grants patch on the status subresource only.
+    statusClient client.Client
 ```
 
 ### Wake lock (`pkg/gateway/wakelock.go`)
@@ -1015,14 +1955,17 @@ func (w *WakeLock) Wake(ctx context.Context, envName string, triggerFn func(cont
 // wake locks and semaphores, allowing duplicate restorations and exceeding global limits.
 // Distributed coordination (e.g., a Kubernetes Lease) is a future extension.
 type Handler struct {
-    envCache        cache.Cache
-    forgeAPI        *http.Client   // client to POST /api/v1/environments/:name/restore
-    forgeAPIURL     string
-    forgeAPIToken   string         // bearer token; loaded from K8s Secret at startup
-    wakeLock        *WakeLock
-    capacityWorker  *capacity.Worker
-    timeout         time.Duration  // default 60s
-    domain          string         // e.g. "dev.local"
+    envCache      cache.Cache
+    forgeAPI      *http.Client // client to POST /api/v1/environments/{name}/restore
+    forgeAPIURL   string
+    forgeAPIToken string // bearer token; injected by the Vault agent sidecar as a file
+    wakeLock      *WakeLock
+    // RestoreLimiter ONLY — never capacity.Worker. The Worker's admission state
+    // (countActive, evictLRUByPriority) lives in the operator process; a copy in
+    // the gateway would read zero active environments and admit without limit.
+    restoreLimiter capacity.RestoreLimiter
+    timeout        time.Duration // default 60s
+    domain         string        // e.g. "dev.local"
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1034,7 +1977,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    state, err := GetEnvironmentState(h.envCache, envName)
+    // The full object is needed, not just the state: drift policy enforcement and
+    // banner injection both read spec.drift and status.drift. This is a cache read,
+    // so it costs no API call on the request path.
+    env, err := GetEnvironment(h.envCache, envName)
     if apierrors.IsNotFound(err) {
         http.Error(w, "environment not found", http.StatusNotFound)
         return
@@ -1044,18 +1990,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    switch state {
+    // Drift policy "block" is evaluated BEFORE the state switch: a stale
+    // environment should not be woken only to be refused after it is running.
+    if env.Spec.Drift.Policy == "block" && env.Status.Drift != nil && env.Status.Drift.Stale {
+        w.Header().Set("Content-Type", "text/html; charset=utf-8")
+        w.WriteHeader(http.StatusConflict)
+        renderRebaseRequiredPage(w, env)
+        return
+    }
+
+    switch env.Status.LifecycleState {
     case v1alpha1.StateActive:
-        h.forwardToApp(w, r, envName)
+        h.forwardToApp(w, r, env)
 
     case v1alpha1.StateWarmHibernated, v1alpha1.StateDeepHibernated:
-        h.wakeAndForward(w, r, envName)
+        h.wakeAndForward(w, r, env)
 
     case v1alpha1.StateRestoring:
         // Join the existing wake lock rather than serving a waking page, so API
         // clients get a forwarded response after readiness (not just 202).
         // Browser clients also join but see a live-updating waking page while they wait.
-        h.wakeAndForward(w, r, envName)
+        h.wakeAndForward(w, r, env)
 
     case v1alpha1.StateProvisioning:
         h.serveWakingPage(w, r, "Environment is being provisioned…")
@@ -1064,10 +2019,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "environment has been terminated", http.StatusGone)
 
     case v1alpha1.StateRestorationFailed:
-        // Incoming request resets the failed state so the operator retries.
-        h.wakeAndForward(w, r, envName)
+        // A real request is the signal that a human is waiting, which is exactly
+        // when spending a retry attempt is justified. Predictive signals
+        // deliberately do not retry failed restorations.
+        h.wakeAndForward(w, r, env)
+
+    case v1alpha1.StateProvisioningFailed:
+        // Explicit, not default: provisioning failed for a reason the user can act
+        // on (bad image, quota), so the reason is surfaced rather than a bare 503.
+        // Recovery is a new commit (`synchronize` → PROVISIONING), not a wake —
+        // waking cannot fix an image that does not exist.
+        w.Header().Set("Retry-After", "60")
+        http.Error(w, "environment failed to provision: "+env.Status.LastFailureReason,
+            http.StatusServiceUnavailable)
 
     default:
+        // Only reachable if a new state is added to the enum without a case here.
         http.Error(w, "environment unavailable", http.StatusServiceUnavailable)
     }
 }
@@ -1092,7 +2059,10 @@ func (h *Handler) hostnameToEnvName(host string) string {
     return name
 }
 
-func (h *Handler) wakeAndForward(w http.ResponseWriter, r *http.Request, envName string) {
+// wakeAndForward takes the full Environment because ServeHTTP has already read it
+// from cache; re-fetching by name here would be a second cache lookup for no gain.
+func (h *Handler) wakeAndForward(w http.ResponseWriter, r *http.Request, env *v1alpha1.Environment) {
+    envName := env.Name
     // Per-request context for the HTTP handler itself (honours client disconnects).
     reqCtx, reqCancel := context.WithTimeout(r.Context(), h.timeout)
     defer reqCancel()
@@ -1107,13 +2077,13 @@ func (h *Handler) wakeAndForward(w http.ResponseWriter, r *http.Request, envName
     // The restore OWNER is the only goroutine that acquires a global slot.
     err := h.wakeLock.Wake(reqCtx, envName, func(_ context.Context) error {
         // Only the owner reaches here. Acquire a global concurrent-restoration slot.
-        if err := h.capacityWorker.AcquireRestoreSlot(restoreCtx); err != nil {
+        if err := h.restoreLimiter.AcquireRestoreSlot(restoreCtx); err != nil {
             if errors.Is(err, capacity.ErrQueueFull) {
                 return capacity.ErrQueueFull
             }
             return err
         }
-        defer h.capacityWorker.ReleaseRestoreSlot()
+        defer h.restoreLimiter.ReleaseRestoreSlot()
         return h.triggerRestore(restoreCtx, envName)
     })
 
@@ -1131,7 +2101,48 @@ func (h *Handler) wakeAndForward(w http.ResponseWriter, r *http.Request, envName
         return
     }
 
-    h.forwardToApp(w, r, envName)
+    // Re-read from cache: the environment was hibernated when this function was
+    // entered, and forwardToApp needs the post-restore object for the banner check.
+    env, err := GetEnvironment(h.envCache, envName)
+    if err != nil {
+        http.Error(w, "environment disappeared during restoration", http.StatusServiceUnavailable)
+        return
+    }
+    h.forwardToApp(w, r, env)
+}
+
+// forwardToApp proxies the request to the environment's in-cluster Service.
+//
+// This is where drift banner injection is wired: ModifyResponse is the only hook
+// that sees the response body before it reaches the client. The proxy is built
+// per request rather than cached because ModifyResponse closes over `env`, whose
+// drift status changes independently of the request.
+func (h *Handler) forwardToApp(w http.ResponseWriter, r *http.Request, env *v1alpha1.Environment) {
+    target := &url.URL{
+        Scheme: "http",
+        // Service DNS inside the cluster: <name>.<namespace>.svc.cluster.local
+        Host: fmt.Sprintf("%s.%s.svc.cluster.local:%d",
+            env.Name, env.Status.NamespaceName, env.Spec.Image.Port),
+    }
+
+    proxy := httputil.NewSingleHostReverseProxy(target)
+    proxy.ModifyResponse = func(resp *http.Response) error {
+        return h.maybeInjectDriftBanner(resp, env)
+    }
+    proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+        // The Pod can disappear between the readiness check and the proxy dial
+        // (eviction, node pressure). A 502 with a retry hint is more honest than
+        // a Go stack trace leaking into the reviewer's browser.
+        w.Header().Set("Retry-After", "5")
+        http.Error(w, "environment backend unavailable", http.StatusBadGateway)
+    }
+
+    // Debounced activity write — at most once per 10s per environment, regardless
+    // of request rate. Without debouncing a page with 50 assets writes the status
+    // subresource 50 times, and etcd write rate becomes the bottleneck.
+    h.recordActivity(env.Name)
+
+    proxy.ServeHTTP(w, r)
 }
 
 func (h *Handler) triggerRestore(ctx context.Context, envName string) error {
@@ -1256,6 +2267,26 @@ func bearerTokenMiddleware(next http.Handler, token string) http.Handler {
 ### Create environment handler
 
 ```go
+// CreateEnvironmentRequest is the REST body. Every optional field maps to a CRD
+// field with a kubebuilder default, so an empty value here means "use the default"
+// rather than "set to zero" — which is why the durations are strings, not
+// time.Duration (a zero Duration is indistinguishable from an unset one).
+type CreateEnvironmentRequest struct {
+    Name        string `json:"name"`        // must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$
+    Repository  string `json:"repository"`
+    PullRequest int    `json:"pullRequest"`
+    Owner       string `json:"owner"`
+    Image       string `json:"image"` // tag only; the repository path is derived
+    Port        int32  `json:"port,omitempty"`
+    BaseBranch  string `json:"baseBranch,omitempty"`
+    BaseRepo    string `json:"baseRepo,omitempty"`
+
+    TTL                string `json:"ttl,omitempty"`
+    Priority           string `json:"priority,omitempty"`
+    WarmHibernateAfter string `json:"warmHibernateAfter,omitempty"`
+    DeepHibernateAfter string `json:"deepHibernateAfter,omitempty"`
+}
+
 func (h *APIHandler) CreateEnvironment(w http.ResponseWriter, r *http.Request) {
     var req CreateEnvironmentRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1268,8 +2299,19 @@ func (h *APIHandler) CreateEnvironment(w http.ResponseWriter, r *http.Request) {
         Spec: v1alpha1.EnvironmentSpec{
             Repository:  req.Repository,
             PullRequest: req.PullRequest,
-            Image:       v1alpha1.ImageSpec{Repository: req.Repository, Tag: req.Image},
-            Lifecycle:   v1alpha1.LifecyclePolicy{TTL: req.TTL, InactivityTimeout: req.InactivityTimeout},
+            Owner:       req.Owner,
+            BaseBranch:  req.BaseBranch,
+            BaseRepo:    req.BaseRepo,
+            Image:       v1alpha1.ImageSpec{Repository: req.Repository, Tag: req.Image, Port: req.Port},
+            // InactivityTimeout no longer exists — hibernation timing is expressed
+            // through Priority plus the explicit Warm/DeepHibernateAfter fields.
+            // Empty strings here fall through to the kubebuilder defaults.
+            Lifecycle: v1alpha1.LifecyclePolicy{
+                TTL:                req.TTL,
+                Priority:           req.Priority,
+                WarmHibernateAfter: req.WarmHibernateAfter,
+                DeepHibernateAfter: req.DeepHibernateAfter,
+            },
         },
     }
 
@@ -1291,6 +2333,121 @@ func (h *APIHandler) CreateEnvironment(w http.ResponseWriter, r *http.Request) {
 
 ## 8. Webhook Receiver — Event Processing
 
+### Payload types (`pkg/webhook/payloads.go`)
+
+Only the fields Forge reads are declared; GitHub sends far more. Getting a path wrong here fails silently — `encoding/json` leaves unmatched fields at their zero value, so a mistyped tag yields an empty string rather than an error.
+
+```go
+type GitHubUser struct {
+    Login string `json:"login"`
+    // "User" or "Bot". Predictive wake skips bots: a Dependabot PR or a CI bot
+    // comment does not mean a human is about to open the preview.
+    Type string `json:"type"`
+}
+
+type GitHubRepo struct {
+    Name     string `json:"name"`      // "payments"
+    FullName string `json:"full_name"` // "team-a/payments"
+}
+
+type PRRef struct {
+    Ref  string     `json:"ref"` // branch name, e.g. "main"
+    SHA  string     `json:"sha"`
+    Repo GitHubRepo `json:"repo"`
+}
+
+type PullRequest struct {
+    Number int        `json:"number"`
+    User   GitHubUser `json:"user"`
+    Head   PRRef      `json:"head"` // the PR's own branch
+    Base   PRRef      `json:"base"` // what it merges INTO — drift compares against this
+}
+
+type GitHubPRPayload struct {
+    Action      string      `json:"action"`
+    PullRequest PullRequest `json:"pull_request"`
+    Repository  GitHubRepo  `json:"repository"`
+    Sender      GitHubUser  `json:"sender"`
+    // Present only on action == "edited". Changes.Base is non-nil when the PR was
+    // retargeted to a different base branch.
+    Changes struct {
+        Base *struct {
+            Ref struct {
+                From string `json:"from"`
+            } `json:"ref"`
+        } `json:"base"`
+    } `json:"changes"`
+}
+
+type ReviewPayload struct {
+    Action      string      `json:"action"` // "submitted" | "edited" | "dismissed"
+    PullRequest PullRequest `json:"pull_request"`
+    Repository  GitHubRepo  `json:"repository"`
+    Sender      GitHubUser  `json:"sender"`
+}
+
+type IssueCommentPayload struct {
+    Action string `json:"action"`
+    Issue  struct {
+        Number int `json:"number"`
+        // nil for a plain issue. This event fires for issues AND pull requests, so
+        // without this check every comment on every issue attempts a wake for an
+        // environment that does not exist.
+        PullRequest *struct {
+            URL string `json:"url"`
+        } `json:"pull_request"`
+    } `json:"issue"`
+    Repository GitHubRepo `json:"repository"`
+    Sender     GitHubUser `json:"sender"`
+}
+
+type CheckSuitePayload struct {
+    Action     string     `json:"action"` // "completed"
+    Repository GitHubRepo `json:"repository"`
+    Sender     GitHubUser `json:"sender"`
+    CheckSuite struct {
+        Conclusion string `json:"conclusion"` // "success" | "failure" | ...
+        // Empty for a suite attached to a push with no associated PR (e.g. on main).
+        PullRequests []struct {
+            Number int `json:"number"`
+        } `json:"pull_requests"`
+    } `json:"check_suite"`
+}
+
+type PushPayload struct {
+    Ref        string     `json:"ref"` // "refs/heads/main"
+    Deleted    bool       `json:"deleted"`
+    Repository GitHubRepo `json:"repository"`
+    Sender     GitHubUser `json:"sender"`
+}
+```
+
+**`repository` vs `pull_request.base.repo`:** for a PR opened from a fork these differ. `repository` is where the PR *lives* (the base repo for a PR event), while `pull_request.head.repo` is the fork. Drift must compare against `pull_request.base.repo.full_name`, which is why `Spec.BaseRepo` is stored explicitly rather than derived from `payload.Repository`.
+
+### Handler struct
+
+```go
+type WebhookHandler struct {
+    // Writing client, not an informer cache: the webhook creates Environments and
+    // patches both spec (base branch, image tag) and status (headSHA, drift,
+    // predictive state transition).
+    Client client.Client
+
+    // HMAC secret, injected as a file by the Vault agent sidecar — never an env var.
+    secret string
+
+    GitHub *github.Client // CompareCommits
+    CI     CITrigger      // drift auto-rebuild only
+
+    // Admitter, not the full Worker: the webhook only ever asks HasFreeSlot before
+    // a predictive wake. It must never admit or evict. Field name matches the
+    // reconciler's so the same dependency is not called two different things.
+    CapacityWorker capacity.Admitter
+}
+```
+
+Unlike the gateway, the webhook receiver is **stateless** — it holds no locks, no semaphores, and no in-memory counters. It is therefore the correct place for the HPA (see HLD §7), since burst traffic from a merge train is real and horizontal scaling is safe.
+
 ### Signature validation + dispatch
 
 ```go
@@ -1309,9 +2466,16 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
     }
 
     event := r.Header.Get("X-GitHub-Event")
+
+    // GitHub retries a delivery for up to ~3 attempts on 5xx. Every handler below
+    // must be idempotent because a retried delivery replays the same event.
     switch event {
     case "pull_request":
         h.handlePullRequest(w, r, body)
+    case "pull_request_review", "issue_comment", "check_suite":
+        h.handleIntentSignal(w, r, event, body)
+    case "push":
+        h.handlePush(w, r, body)
     default:
         w.WriteHeader(http.StatusNoContent) // ignore other events
     }
@@ -1336,9 +2500,26 @@ func (h *WebhookHandler) handlePullRequest(w http.ResponseWriter, r *http.Reques
     case "opened", "reopened":
         opErr = h.createOrUpdateEnvironment(r.Context(), envName, payload)
     case "synchronize":
+        // A new commit changes the image AND moves the merge base (the developer
+        // may have rebased), so the branch point must be recomputed here or drift
+        // will be measured against a commit that is no longer the merge base.
         opErr = h.updateImageTag(r.Context(), envName, payload)
+        if opErr == nil {
+            opErr = h.refreshBranchPoint(r.Context(), envName, payload)
+        }
     case "closed":
         opErr = h.terminateEnvironment(r.Context(), envName)
+    case "edited":
+        // The PR's base branch can be retargeted (e.g. main → release/1.4) without
+        // any code change. Spec.BaseBranch must follow, or drift keeps comparing
+        // against a branch this PR no longer targets.
+        if payload.Changes.Base != nil {
+            opErr = h.updateBaseBranch(r.Context(), envName, payload)
+        }
+    case "review_requested":
+        // Strongest intent signal: a named human has been asked to review and will
+        // click the preview link within minutes.
+        opErr = h.predictiveWake(r.Context(), envName, "review_requested", payload.Sender)
     }
     if opErr != nil {
         http.Error(w, "failed to process webhook event", http.StatusInternalServerError)
@@ -1356,6 +2537,554 @@ func validateSignature(body []byte, sig, secret string) bool {
 }
 ```
 
+### Environment create and update (`pkg/webhook/handler.go`)
+
+Both paths must write `Status.HeadSHA`. It is the git commit drift detection compares against the base branch, and nothing else sets it — without these writes `evaluateDrift` short-circuits and drift silently never runs.
+
+```go
+func (h *WebhookHandler) createOrUpdateEnvironment(ctx context.Context, envName string, p GitHubPRPayload) error {
+    env := &v1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: envName}}
+    op, err := ctrl.CreateOrUpdate(ctx, h.Client, env, func() error {
+        env.Spec.Repository  = sanitizeRepoName(p.Repository.Name)
+        env.Spec.PullRequest = p.PullRequest.Number
+        env.Spec.Owner       = p.PullRequest.User.Login
+        // Base branch and base repo come from the BASE side of the PR, not from
+        // p.Repository — for a fork PR those are different repositories.
+        env.Spec.BaseBranch  = p.PullRequest.Base.Ref
+        env.Spec.BaseRepo    = p.PullRequest.Base.Repo.FullName
+        env.Spec.Image.Tag   = imageTagForSHA(p.PullRequest.Head.SHA)
+        return nil
+    })
+    if err != nil {
+        return err
+    }
+    _ = op
+    // HeadSHA lives in status, so it needs a second write — status is a separate
+    // subresource and is not persisted by CreateOrUpdate above.
+    return h.patchHeadSHA(ctx, env, p.PullRequest.Head.SHA)
+}
+
+func (h *WebhookHandler) updateImageTag(ctx context.Context, envName string, p GitHubPRPayload) error {
+    var env v1alpha1.Environment
+    if err := h.Client.Get(ctx, client.ObjectKey{Name: envName}, &env); err != nil {
+        // A `synchronize` can arrive for a PR whose environment was terminated
+        // (closed then reopened out of order). Recreate rather than fail.
+        if apierrors.IsNotFound(err) {
+            return h.createOrUpdateEnvironment(ctx, envName, p)
+        }
+        return err
+    }
+    patch := client.MergeFrom(env.DeepCopy())
+    env.Spec.Image.Tag = imageTagForSHA(p.PullRequest.Head.SHA)
+    if err := h.Client.Patch(ctx, &env, patch); err != nil {
+        return err
+    }
+    // A new commit invalidates both the digest and the drift baseline.
+    return h.patchHeadSHA(ctx, &env, p.PullRequest.Head.SHA)
+}
+
+// patchHeadSHA records the PR head commit and clears the stale OCI digest, so the
+// next reconcile resolves a fresh digest for the new image rather than redeploying
+// the previous one.
+func (h *WebhookHandler) patchHeadSHA(ctx context.Context, env *v1alpha1.Environment, sha string) error {
+    if env.Status.HeadSHA == sha {
+        return nil // idempotent: a retried webhook delivery writes nothing
+    }
+    patch := client.MergeFrom(env.DeepCopy())
+    env.Status.HeadSHA     = sha
+    env.Status.ImageDigest = ""
+    return h.Client.Status().Patch(ctx, env, patch)
+}
+
+// terminateEnvironment deletes the Environment CRD. The finalizer then drives
+// the TERMINATING reconcile, which deletes the namespace and only removes the
+// finalizer once the namespace is confirmed gone.
+//
+// Deleting an already-deleted environment is not an error: GitHub retries
+// deliveries, and a PR can be closed twice (closed, then merged).
+func (h *WebhookHandler) terminateEnvironment(ctx context.Context, envName string) error {
+    env := &v1alpha1.Environment{ObjectMeta: metav1.ObjectMeta{Name: envName}}
+    return client.IgnoreNotFound(h.Client.Delete(ctx, env))
+}
+
+// updateBaseBranch follows a PR that was retargeted to a different base branch.
+func (h *WebhookHandler) updateBaseBranch(ctx context.Context, envName string, p GitHubPRPayload) error {
+    var env v1alpha1.Environment
+    if err := h.Client.Get(ctx, client.ObjectKey{Name: envName}, &env); err != nil {
+        return client.IgnoreNotFound(err)
+    }
+    patch := client.MergeFrom(env.DeepCopy())
+    env.Spec.BaseBranch = p.PullRequest.Base.Ref
+    env.Spec.BaseRepo   = p.PullRequest.Base.Repo.FullName
+    if err := h.Client.Patch(ctx, &env, patch); err != nil {
+        return err
+    }
+    // The old merge base is meaningless against the new branch.
+    return h.evaluateDrift(ctx, &env)
+}
+```
+
+### Intent signal dispatch (`pkg/webhook/predictive.go`)
+
+```go
+// handleIntentSignal processes the three non-pull_request events that imply a
+// human is about to open the preview. Each carries the PR number in a different
+// place, so extraction is per-event; the decision logic afterwards is shared.
+func (h *WebhookHandler) handleIntentSignal(w http.ResponseWriter, r *http.Request, event string, body []byte) {
+    var (
+        prNumber int
+        repoName string
+        sender   GitHubUser
+        reason   string
+    )
+
+    switch event {
+    case "pull_request_review":
+        var p ReviewPayload
+        if err := json.Unmarshal(body, &p); err != nil {
+            http.Error(w, "invalid payload", http.StatusBadRequest)
+            return
+        }
+        // "dismissed" means a review was withdrawn — not an arrival signal.
+        if p.Action != "submitted" {
+            w.WriteHeader(http.StatusNoContent)
+            return
+        }
+        prNumber, repoName, sender, reason = p.PullRequest.Number, p.Repository.Name, p.Sender, "review_submitted"
+
+    case "issue_comment":
+        var p IssueCommentPayload
+        if err := json.Unmarshal(body, &p); err != nil {
+            http.Error(w, "invalid payload", http.StatusBadRequest)
+            return
+        }
+        // issue_comment fires for BOTH issues and PRs. An issue has no environment,
+        // and PullRequest is nil in that case — without this guard every comment on
+        // every issue in the repo would attempt a wake.
+        if p.Action != "created" || p.Issue.PullRequest == nil {
+            w.WriteHeader(http.StatusNoContent)
+            return
+        }
+        prNumber, repoName, sender, reason = p.Issue.Number, p.Repository.Name, p.Sender, "pr_comment"
+
+    case "check_suite":
+        var p CheckSuitePayload
+        if err := json.Unmarshal(body, &p); err != nil {
+            http.Error(w, "invalid payload", http.StatusBadRequest)
+            return
+        }
+        // Only a PASSING suite predicts a review. A failing suite predicts the
+        // author pushing a fix, which arrives as `synchronize` and redeploys anyway.
+        if p.Action != "completed" || p.CheckSuite.Conclusion != "success" {
+            w.WriteHeader(http.StatusNoContent)
+            return
+        }
+        // A check_suite can be attached to a push with no PR (e.g. on main).
+        if len(p.CheckSuite.PullRequests) == 0 {
+            w.WriteHeader(http.StatusNoContent)
+            return
+        }
+        prNumber, repoName, sender, reason = p.CheckSuite.PullRequests[0].Number, p.Repository.Name, p.Sender, "ci_passed"
+    }
+
+    envName := fmt.Sprintf("%s-pr-%d", sanitizeRepoName(repoName), prNumber)
+    if err := h.predictiveWake(r.Context(), envName, reason, sender); err != nil {
+        http.Error(w, "failed to process intent signal", http.StatusInternalServerError)
+        return
+    }
+    w.WriteHeader(http.StatusNoContent)
+}
+
+// predictiveWake moves a hibernated environment to RESTORING ahead of any traffic.
+// It is deliberately conservative: it never evicts a running environment, never
+// consumes a restoration retry budget, and never resurrects a dying one.
+func (h *WebhookHandler) predictiveWake(ctx context.Context, envName, reason string, sender GitHubUser) error {
+    // A bot assigning a reviewer or a CI bot commenting does not mean a human is
+    // coming. Without this filter a Dependabot-heavy repo wakes environments all
+    // day for nobody.
+    if sender.Type == "Bot" {
+        metrics.RecordWakeDecision("skipped_bot")
+        return nil
+    }
+
+    var env v1alpha1.Environment
+    if err := h.Client.Get(ctx, client.ObjectKey{Name: envName}, &env); err != nil {
+        if apierrors.IsNotFound(err) {
+            // Comment on a PR whose environment was never created or already
+            // terminated. Not an error — returning 5xx would make GitHub retry.
+            metrics.RecordWakeDecision("no_environment")
+            return nil
+        }
+        return err
+    }
+
+    if env.Spec.Lifecycle.PredictiveWake != nil && !*env.Spec.Lifecycle.PredictiveWake {
+        metrics.RecordWakeDecision("disabled")
+        return nil
+    }
+
+    // An environment past its TTL is about to be terminated. Waking it would burn
+    // a restoration slot on something that disappears moments later.
+    if env.Status.ExpiresAt != nil && time.Now().After(env.Status.ExpiresAt.Time) {
+        metrics.RecordWakeDecision("expired")
+        return nil
+    }
+
+    switch env.Status.LifecycleState {
+    case v1alpha1.StateWarmHibernated, v1alpha1.StateDeepHibernated:
+        // The only states a predictive wake acts on.
+    case v1alpha1.StateActive, v1alpha1.StateProvisioning, v1alpha1.StateRestoring:
+        // Already up or already coming up. This is also what deduplicates the
+        // burst of three signals (review_requested, ci_passed, comment) that a
+        // single "PR is ready" moment produces within seconds of each other.
+        metrics.RecordWakeDecision("already_up")
+        return nil
+    default:
+        // TERMINATING, TERMINATED, PROVISIONING_FAILED, RESTORATION_FAILED.
+        // Never resurrect a dying environment, and never spend a retry attempt on
+        // a failed one — real traffic through the gateway is what retries those,
+        // so a human is actually waiting when the attempt is consumed.
+        metrics.RecordWakeDecision("ineligible")
+        return nil
+    }
+
+    // Capacity check is ADVISORY ONLY: a predictive wake must never evict a
+    // running environment that someone may be using to make room for a guess.
+    // Reactive wakes (a real request) may evict; predictive ones yield.
+    hasRoom, err := h.CapacityWorker.HasFreeSlot(ctx)
+    if err != nil {
+        return err
+    }
+    if !hasRoom {
+        metrics.RecordWakeDecision("no_capacity")
+        return nil
+    }
+
+    patch := client.MergeFrom(env.DeepCopy())
+    env.Status.LifecycleState      = v1alpha1.StateRestoring
+    env.Status.RestorationTrigger  = v1alpha1.TriggerPredictive
+    env.Status.RestorationStartedAt = nil // operator stamps it on entry
+    env.Status.Message             = "predictive wake: " + reason
+    if err := h.Client.Status().Patch(ctx, &env, patch); err != nil {
+        // A conflict means the lifecycle manager changed state concurrently
+        // (e.g. it hibernated or terminated at the same instant). Its decision
+        // wins; a dropped predictive wake is harmless because the reactive path
+        // still covers the reviewer when they actually arrive.
+        if apierrors.IsConflict(err) {
+            metrics.RecordWakeDecision("conflict")
+            return nil
+        }
+        return err
+    }
+    metrics.RecordWakeDecision("triggered")
+    return nil
+}
+```
+
+**Predictive wake decision table:**
+
+| Condition | Action | Reason |
+|---|---|---|
+| Sender is a Bot | Skip | A bot event does not imply a human will visit |
+| Environment not found | Skip, return 204 | PR has no environment; 5xx would cause GitHub retries |
+| `predictiveWake: false` | Skip | Explicitly opted out |
+| TTL already expired | Skip | Environment is about to be terminated |
+| State is WARM/DEEP_HIBERNATED | **Wake** | The only actionable case |
+| State is ACTIVE / PROVISIONING / RESTORING | Skip | Already up — also deduplicates signal bursts |
+| State is TERMINATING / TERMINATED | Skip | Never resurrect a dying environment |
+| State is PROVISIONING_FAILED | Skip | Provisioning failed for a reason; retrying on a comment spams |
+| State is RESTORATION_FAILED | Skip | Do not spend a retry attempt when no one is waiting |
+| No capacity free | Skip | A guess must never evict a running environment |
+| Status patch conflicts | Skip | Lifecycle manager won the race; reactive path still covers the user |
+
+**Predictive miss handling.** A predictive wake that nobody follows up on holds a slot. The lifecycle manager therefore applies `PredictiveWakeTTL` (default 10m) instead of `WarmHibernateAfter` (default 15m) while `RestorationTrigger == "predictive"` and no request has arrived since `RestoredAt`. On the first real request the gateway patches `LastActivityAt`, the lifecycle manager observes `LastActivityAt > RestoredAt`, records `forge_predictive_wakeups_total{result="hit"}`, and reverts to the normal timeout. If the TTL expires with no request it records `result="miss"` and re-hibernates.
+
+---
+
+## 8a. Drift Detection
+
+### Branch point capture
+
+The merge base is recorded at provisioning time and refreshed on every `synchronize`, because a rebase moves it. Comparing against a stale branch point reports drift that was already resolved.
+
+```go
+// refreshBranchPoint calls GitHub's compare API to find how far the base branch
+// has moved ahead of this PR's merge base.
+//
+// Rate limiting: authenticated GitHub API allows 5000 req/h. This is called once
+// per `synchronize` and once per push to a watched base branch — not on a timer —
+// so 100 active PRs with hourly pushes stays well inside the budget. An ETag is
+// cached per (repo, base, head) pair so unchanged comparisons return 304 and do
+// not count against the limit.
+func (h *WebhookHandler) refreshBranchPoint(ctx context.Context, envName string, p GitHubPRPayload) error {
+    var env v1alpha1.Environment
+    if err := h.Client.Get(ctx, client.ObjectKey{Name: envName}, &env); err != nil {
+        return client.IgnoreNotFound(err)
+    }
+    if env.Spec.Drift.Policy == "off" || env.Spec.BaseBranch == "" {
+        return nil
+    }
+
+    cmp, err := h.GitHub.CompareCommits(ctx, env.Spec.BaseRepo, env.Spec.BaseBranch, p.PullRequest.Head.SHA)
+    if err != nil {
+        // Drift is advisory. A GitHub outage or a rate-limit must never fail the
+        // environment — the error is recorded and the previous numbers are kept,
+        // visibly stale via LastCheckedAt.
+        return h.patchDriftError(ctx, &env, err)
+    }
+    return h.patchDrift(ctx, &env, cmp)
+}
+```
+
+### Push handler
+
+```go
+// handlePush fires for every push to every branch. Only pushes to a branch that
+// is some environment's BASE branch matter; a push to a PR's own head branch is
+// already covered by the `synchronize` event.
+func (h *WebhookHandler) handlePush(w http.ResponseWriter, r *http.Request, body []byte) {
+    var p PushPayload
+    if err := json.Unmarshal(body, &p); err != nil {
+        http.Error(w, "invalid payload", http.StatusBadRequest)
+        return
+    }
+    branch := strings.TrimPrefix(p.Ref, "refs/heads/")
+
+    // Branch deletion sends a push with an all-zero after-SHA and no commits.
+    if p.Deleted {
+        w.WriteHeader(http.StatusNoContent)
+        return
+    }
+
+    // Detached from the request context: a monorepo push can fan out to many
+    // comparisons, and GitHub closes the webhook connection after 10s. Tying the
+    // work to r.Context() would cancel the remaining environments mid-loop. The
+    // 204 is returned promptly below regardless of how long the fan-out takes.
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+    defer cancel()
+
+    var list v1alpha1.EnvironmentList
+    if err := h.Client.List(ctx, &list); err != nil {
+        http.Error(w, "failed to list environments", http.StatusInternalServerError)
+        return
+    }
+
+    // Drift is recomputed for every environment whose base is this branch. The
+    // comparison is one API call per environment, so a monorepo with 100 open PRs
+    // against main costs 100 calls per push to main. The ETag cache collapses most
+    // of these because only the head SHA differs per PR; if the budget is still a
+    // concern, CommitThreshold can be raised to reduce how often it matters.
+    for i := range list.Items {
+        env := &list.Items[i]
+        if env.Spec.BaseBranch != branch || env.Spec.BaseRepo != p.Repository.FullName {
+            continue
+        }
+        if env.Spec.Drift.Policy == "off" {
+            continue
+        }
+        // Terminating environments are not worth an API call.
+        if env.Status.LifecycleState == v1alpha1.StateTerminating ||
+            env.Status.LifecycleState == v1alpha1.StateTerminated {
+            continue
+        }
+        if err := h.evaluateDrift(ctx, env); err != nil {
+            // Logged, not returned: one environment's failure must not cause
+            // GitHub to retry the push event and re-evaluate all the others.
+            log.Error(err, "drift evaluation failed", "environment", env.Name)
+        }
+    }
+    w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *WebhookHandler) evaluateDrift(ctx context.Context, env *v1alpha1.Environment) error {
+    // HeadSHA, never ImageDigest. ImageDigest is an OCI sha256 digest with no
+    // relationship to git history — GitHub returns 404 for every such comparison.
+    if env.Status.HeadSHA == "" {
+        return nil // environment predates HeadSHA capture; nothing to compare
+    }
+    cmp, err := h.GitHub.CompareCommits(ctx, env.Spec.BaseRepo, env.Spec.BaseBranch, env.Status.HeadSHA)
+    if err != nil {
+        return h.patchDriftError(ctx, env, err)
+    }
+
+    stale := false
+    if env.Spec.Drift.CommitThreshold > 0 && cmp.BehindBy >= env.Spec.Drift.CommitThreshold {
+        stale = true
+    }
+    // Age trigger catches the opposite failure mode: a low-traffic repo where the
+    // base moves 3 commits in a month. Commit count alone would never flag it.
+    if maxAge, err := time.ParseDuration(env.Spec.Drift.MaxAge); err == nil && maxAge > 0 {
+        if cmp.MergeBaseAt != nil && time.Since(*cmp.MergeBaseAt) > maxAge {
+            stale = true
+        }
+    }
+
+    now := metav1.Now()
+    patch := client.MergeFrom(env.DeepCopy())
+    env.Status.Drift = &v1alpha1.DriftStatus{
+        BranchPoint:    cmp.MergeBaseSHA,
+        BaseHead:       cmp.BaseHeadSHA,
+        CommitsBehind:  cmp.BehindBy,
+        BranchPointAt:  cmp.MergeBaseAt,
+        Stale:          stale,
+        LastCheckedAt:  &now,
+        LastRebuildAt:  env.Status.Drift.GetLastRebuildAt(), // preserved across checks
+    }
+    if err := h.Client.Status().Patch(ctx, env, patch); err != nil {
+        return err
+    }
+
+    if stale && env.Spec.Drift.Policy == "auto-rebuild" {
+        return h.maybeAutoRebuild(ctx, env)
+    }
+    return nil
+}
+
+// maybeAutoRebuild triggers a rebuild, guarded by a cooldown.
+//
+// Without the cooldown this loops: rebuild → new image → `synchronize` →
+// branch point refreshed → base has moved again → rebuild. On a busy base branch
+// that is an unbounded build loop.
+func (h *WebhookHandler) maybeAutoRebuild(ctx context.Context, env *v1alpha1.Environment) error {
+    d := env.Status.Drift
+    if d.LastRebuildAt != nil && time.Since(d.LastRebuildAt.Time) < v1alpha1.DriftRebuildCooldown {
+        return nil
+    }
+    // A hibernated environment is NOT woken to rebuild. Rebuilding something
+    // nobody is looking at spends a restoration slot and a build; the rebuild
+    // happens on its next real wake instead.
+    if env.Status.LifecycleState != v1alpha1.StateActive {
+        return nil
+    }
+    if err := h.CI.TriggerRebuild(ctx, env.Spec.BaseRepo, env.Spec.PullRequest); err != nil {
+        // Falls back to warn behaviour: Stale stays true, so the gateway still
+        // shows the banner even though the rebuild could not be started.
+        return h.patchDriftError(ctx, env, err)
+    }
+    now := metav1.Now()
+    patch := client.MergeFrom(env.DeepCopy())
+    env.Status.Drift.LastRebuildAt = &now
+    metrics.RecordDriftRebuild()
+    return h.Client.Status().Patch(ctx, env, patch)
+}
+```
+
+### Gateway-side enforcement
+
+The gateway reads `status.drift` from its informer cache — no extra API call on the request path. Policy `block` is evaluated in `ServeHTTP` **before** the lifecycle-state switch (see §6), so a stale environment is never woken just to be refused once it is running.
+
+**Banner injection (policy `warn`) and why it is narrowly scoped.** Rewriting a proxied response body is the single most dangerous thing the gateway does. Injection happens **only** when every one of these holds:
+
+| Guard | Why |
+|---|---|
+| `Content-Type` starts with `text/html` | JSON/XML/images must never be mutated — injecting into an API response corrupts it |
+| `Content-Encoding` is empty | A gzipped body cannot be string-matched; decompressing and recompressing on the request path is not worth the cost |
+| Status is `200` | Never touch `206 Partial Content` (byte ranges break) or redirects |
+| `Transfer-Encoding` is not `chunked` with a streaming body | A streamed response has no safe insertion point |
+| A `<body` tag is found in the first 8 KB | Bounds the scan; if the tag is further in, injection is skipped |
+
+When injection proceeds, `Content-Length` is recalculated (or the header deleted and the response streamed) — a stale `Content-Length` truncates the page in every browser. The banner is a single `<div>` with inline styles; it carries no script, so a strict `Content-Security-Policy` on the app cannot break it and it cannot break the app.
+
+```go
+func (h *Handler) maybeInjectDriftBanner(resp *http.Response, env *v1alpha1.Environment) error {
+    if env.Spec.Drift.Policy != "warn" || env.Status.Drift == nil || !env.Status.Drift.Stale {
+        return nil
+    }
+    if resp.StatusCode != http.StatusOK ||
+        !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") ||
+        resp.Header.Get("Content-Encoding") != "" {
+        return nil
+    }
+    body, err := io.ReadAll(io.LimitReader(resp.Body, maxInjectableBody)) // 2 MB cap
+    if err != nil {
+        return err
+    }
+    resp.Body.Close()
+
+    idx := bytes.Index(bytes.ToLower(body[:min(len(body), 8192)]), []byte("<body"))
+    if idx == -1 {
+        resp.Body = io.NopCloser(bytes.NewReader(body)) // pass through untouched
+        return nil
+    }
+    insertAt := bytes.IndexByte(body[idx:], '>') + idx + 1
+    banner := renderDriftBanner(env.Status.Drift, env.Spec.BaseBranch) // html/template-escaped
+
+    out := make([]byte, 0, len(body)+len(banner))
+    out = append(out, body[:insertAt]...)
+    out = append(out, banner...)
+    out = append(out, body[insertAt:]...)
+
+    resp.Body = io.NopCloser(bytes.NewReader(out))
+    resp.ContentLength = int64(len(out))
+    resp.Header.Set("Content-Length", strconv.Itoa(len(out))) // stale value truncates the page
+    return nil
+}
+```
+
+### Rendered pages (`pkg/gateway/pages.go`)
+
+Both use `html/template`, never `fmt.Fprintf`. Drift values originate from the GitHub API and reach the browser, so any string interpolation here is a stored-XSS vector; `html/template` escapes them contextually.
+
+```go
+const maxInjectableBody = 2 << 20 // 2 MB — beyond this, pass through unmodified
+
+var driftBannerTmpl = template.Must(template.New("banner").Parse(
+    `<div style="position:sticky;top:0;z-index:2147483647;background:#7a4a00;` +
+        `color:#fff;font:14px/1.4 system-ui,sans-serif;padding:10px 16px">` +
+        `This preview is <strong>{{.CommitsBehind}}</strong> commit(s) behind ` +
+        `<strong>{{.BaseBranch}}</strong>. It may not reflect what will be merged.` +
+        `</div>`))
+
+// renderDriftBanner returns the snippet inserted after <body>. It is a single div
+// with inline styles and NO script, so a strict Content-Security-Policy on the
+// application cannot suppress it and it cannot interfere with the app's own JS.
+func renderDriftBanner(d *v1alpha1.DriftStatus, baseBranch string) []byte {
+    var buf bytes.Buffer
+    _ = driftBannerTmpl.Execute(&buf, struct {
+        CommitsBehind int
+        BaseBranch    string
+    }{d.CommitsBehind, baseBranch})
+    return buf.Bytes()
+}
+
+var rebaseRequiredTmpl = template.Must(template.New("rebase").Parse(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Rebase required</title></head>
+<body style="font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem">
+<h1>This preview is out of date</h1>
+<p><code>{{.Name}}</code> is <strong>{{.CommitsBehind}}</strong> commit(s) behind
+<strong>{{.BaseBranch}}</strong>, and this environment's drift policy is <code>block</code>.</p>
+<p>Rebase the pull request onto <strong>{{.BaseBranch}}</strong> and push. The environment
+rebuilds automatically and this page will stop appearing.</p>
+</body></html>`))
+
+func renderRebaseRequiredPage(w http.ResponseWriter, env *v1alpha1.Environment) {
+    _ = rebaseRequiredTmpl.Execute(w, struct {
+        Name          string
+        CommitsBehind int
+        BaseBranch    string
+    }{env.Name, env.Status.Drift.CommitsBehind, env.Spec.BaseBranch})
+}
+```
+
+Note the signature: `renderDriftBanner` takes `baseBranch` separately because `DriftStatus` stores commit SHAs, not the branch name — that lives in `Spec.BaseBranch`.
+
+**Drift edge cases:**
+
+| Case | Behaviour |
+|---|---|
+| Force-push to base branch rewrites history | `CompareCommits` recomputes the merge base from scratch; the stored `BranchPoint` is overwritten, never trusted as an anchor |
+| Developer rebases the PR | `synchronize` fires → `refreshBranchPoint` recomputes → `CommitsBehind` drops to 0 |
+| GitHub API down or rate-limited | `LastCheckError` set, previous numbers kept, `LastCheckedAt` reveals the staleness. Never fails the environment |
+| PR from a fork | `BaseRepo` is stored from `pull_request.base.repo.full_name`, which differs from the head repo |
+| Environment hibernated when drift detected | Status updated, no wake. Banner appears on next natural wake |
+| `auto-rebuild` while hibernated | Skipped; rebuild happens on next wake instead of burning a slot |
+| `auto-rebuild` loop risk | 1-hour cooldown via `LastRebuildAt` |
+| `auto-rebuild` fails | Degrades to `warn` behaviour; `Stale` remains true so the banner still shows |
+| High-velocity base branch (100 commits/day) | `CommitThreshold` is per-environment configurable; raise it for busy repos |
+| Low-velocity base branch (3 commits/month) | `MaxAge` trigger catches what commit count misses |
+| Push to an unrelated branch | Filtered by `BaseBranch` + `BaseRepo` match |
+| Branch deleted | `p.Deleted` short-circuits before any comparison |
+
 ---
 
 ## 9. Capacity Worker — Serialized Admission
@@ -1371,17 +3100,52 @@ type admitRequest struct {
     reply    chan error
 }
 
-type Worker struct {
-    client                client.Client
-    maxActive             int
-    maxConcurrentRestores int // default 3
-    maxPendingRestores    int // default 5
-    admitCh               chan admitRequest
-    releaseCh             chan string  // env name released (hibernated or terminated)
-    restoreSem            chan struct{} // counting semaphore for concurrent restorations
-    restoreQueue          []admitRequest
+// slotQuery backs HasFreeSlot. It carries no environment name because it reserves
+// nothing — it only asks whether the active count is below the limit right now.
+type slotQuery struct {
+    reply chan bool
 }
 
+// Worker is the OPERATOR-side admission serialiser. It implements Admitter.
+//
+// It deliberately holds NO restoration state. The restore semaphore lives in the
+// gateway process (RestoreSemaphore below) because the gateway is what receives
+// the requests that trigger restores. Keeping both in one struct would invite the
+// gateway to import Worker, whose maxActive count it cannot see — it would read
+// zero active environments and admit without limit.
+type Worker struct {
+    client    client.Client
+    maxActive int
+    admitCh   chan admitRequest
+    queryCh   chan slotQuery // HasFreeSlot — advisory, non-reserving
+    releaseCh chan string    // env name released (hibernated or terminated)
+}
+
+// RestoreSemaphore is the GATEWAY-side concurrency bound. It implements
+// RestoreLimiter. Process-local, which is why the gateway runs a single replica:
+// two replicas would permit 2 × maxConcurrentRestores.
+type RestoreSemaphore struct {
+    maxConcurrentRestores int           // default 3
+    maxPendingRestores    int           // default 5
+    restoreSem            chan struct{} // counting semaphore
+    pending               atomic.Int32  // waiters, for queue-depth metric and the 429 bound
+}
+
+func NewWorker(c client.Client, maxActive int) *Worker {
+    return &Worker{
+        client:    c,
+        maxActive: maxActive,
+        admitCh:   make(chan admitRequest),
+        queryCh:   make(chan slotQuery),
+        // Buffered: Release is called from the reconciler's goroutine and must not
+        // block it if the worker is mid-admission.
+        releaseCh: make(chan string, 32),
+    }
+}
+
+// Run is the single serialising goroutine. All three channels are handled in one
+// select — this is the only loop. Handling admissions and queries in separate
+// loops would mean one of them never being served.
 func (w *Worker) Run(ctx context.Context) {
     for {
         select {
@@ -1389,11 +3153,78 @@ func (w *Worker) Run(ctx context.Context) {
             return
         case req := <-w.admitCh:
             req.reply <- w.admitOne(ctx, req.envName, req.priority)
+        case q := <-w.queryCh:
+            active, err := w.countActive(ctx)
+            // On a list error, report "no room" rather than guessing yes. A
+            // predictive wake that is wrongly skipped costs nothing; one that is
+            // wrongly admitted breaks the active-environment bound.
+            q.reply <- err == nil && active < w.maxActive
         case name := <-w.releaseCh:
-            _ = name // capacity freed — drain the pending queue
+            _ = name // capacity freed by a hibernation or termination
             w.drainQueue(ctx)
         }
     }
+}
+
+// Release is called by the reconciler on every transition OUT of ACTIVE
+// (warm, deep, terminating). Without this producer nothing ever sends to
+// releaseCh, drainQueue never runs, and a hibernated environment's slot is never
+// handed to whatever is waiting for it.
+func (w *Worker) Release(envName string) {
+    select {
+    case w.releaseCh <- envName:
+    default: // buffer full; the next admission recounts from the API anyway
+    }
+}
+
+// countActive counts environments in ACTIVE. Counted from the API rather than an
+// in-memory tally so an operator restart cannot lose the count.
+func (w *Worker) countActive(ctx context.Context) (int, error) {
+    list := &v1alpha1.EnvironmentList{}
+    if err := w.client.List(ctx, list); err != nil {
+        return 0, err
+    }
+    n := 0
+    for i := range list.Items {
+        switch list.Items[i].Status.LifecycleState {
+        case v1alpha1.StateActive, v1alpha1.StateProvisioning, v1alpha1.StateRestoring:
+            // PROVISIONING and RESTORING count as active: they are on their way to
+            // holding a slot, and excluding them lets maxActive be overshot by
+            // everything currently starting up.
+            n++
+        }
+    }
+    return n, nil
+}
+
+// drainQueue re-reconciles environments parked in PROVISIONING waiting for a slot.
+// It does not keep its own queue — the CRDs are the queue. Touching their status
+// message triggers a watch event, which requeues them through the normal admission
+// path. An in-memory queue would be lost on operator restart.
+func (w *Worker) drainQueue(ctx context.Context) {
+    list := &v1alpha1.EnvironmentList{}
+    if err := w.client.List(ctx, list); err != nil {
+        return
+    }
+    for i := range list.Items {
+        env := &list.Items[i]
+        if env.Status.LifecycleState == v1alpha1.StateProvisioning &&
+            env.Status.Message == "waiting for capacity slot" {
+            _ = w.patchState(ctx, env, v1alpha1.StateProvisioning, "capacity slot released; retrying")
+            return // one at a time; the next release drains the next
+        }
+    }
+}
+
+// patchState is the worker's only write. It uses a merge patch so it cannot
+// clobber fields the operator wrote concurrently.
+func (w *Worker) patchState(ctx context.Context, env *v1alpha1.Environment,
+    state v1alpha1.LifecycleState, msg string) error {
+
+    patch := client.MergeFrom(env.DeepCopy())
+    env.Status.LifecycleState = state
+    env.Status.Message        = msg
+    return w.client.Status().Patch(ctx, env, patch)
 }
 
 func (w *Worker) admitOne(ctx context.Context, envName, priority string) error {
@@ -1425,7 +3256,8 @@ func (w *Worker) evictLRUByPriority(ctx context.Context) error {
         if env.Status.LifecycleState != v1alpha1.StateActive {
             continue
         }
-        if env.Spec.Lifecycle.Pinned || env.Spec.Lifecycle.Priority == "pinned" {
+        // Pinned is expressed only through Priority — there is no separate bool.
+        if env.Spec.Lifecycle.Priority == "pinned" {
             continue
         }
         if candidate == nil {
@@ -1447,6 +3279,7 @@ func (w *Worker) evictLRUByPriority(ctx context.Context) error {
     if candidate == nil {
         return fmt.Errorf("all active environments are pinned")
     }
+    metrics.RecordEviction(candidate.Spec.Lifecycle.Priority)
     return w.patchState(ctx, candidate, v1alpha1.StateWarmHibernated, "evicted under capacity pressure")
 }
 
@@ -1465,46 +3298,88 @@ func (w *Worker) Admit(ctx context.Context, envName, priority string) error {
         return ctx.Err()
     }
 }
+
+// HasFreeSlot reports whether an environment could be admitted right now, WITHOUT
+// reserving anything. Used only by predictive wake, which must never evict a
+// running environment to make room for a speculative one.
+//
+// It is advisory and inherently racy: a slot free at this instant may be taken by
+// the time the status patch lands. That is acceptable — a predictive wake that
+// loses the race is simply dropped, and the reactive path still covers the
+// reviewer when they actually arrive. It goes through the same serialising channel
+// as Admit so it observes a consistent count rather than a torn read.
+func (w *Worker) HasFreeSlot(ctx context.Context) (bool, error) {
+    reply := make(chan bool, 1)
+    select {
+    case w.queryCh <- slotQuery{reply: reply}:
+    case <-ctx.Done():
+        return false, ctx.Err()
+    }
+    select {
+    case free := <-reply:
+        return free, nil
+    case <-ctx.Done():
+        return false, ctx.Err()
+    }
+}
 ```
+
+Both `Admit` and `HasFreeSlot` go through the same `Run` loop above, so they observe the same active count and cannot race against each other.
 
 ### Bounded restoration queue
 
 Restorations are further bounded by a counting semaphore so that at most `maxConcurrentRestores` environments restore simultaneously on the node. The gateway calls `AcquireRestoreSlot` before triggering a restore; the semaphore is released when the restore completes or times out.
 
+**This semaphore lives in the gateway process, not the operator.** It is exposed as `capacity.RestoreLimiter` (§14) and is the reason the gateway is pinned to a single replica: the limit is enforced per process, so two replicas would permit `2 × maxConcurrentRestores`.
+
 ```go
-// AcquireRestoreSlot acquires a concurrent restoration slot.
-// Returns ErrQueueFull if the pending queue is also exhausted.
-func (w *Worker) AcquireRestoreSlot(ctx context.Context) error {
+// AcquireRestoreSlot acquires a concurrent restoration slot, or returns
+// ErrQueueFull when both the slots and the waiting room are exhausted.
+//
+// "Pending" is tracked with an atomic counter, NOT a slice. An earlier design
+// used `len(restoreQueue)`, but nothing ever appended to that slice, so the
+// bound was always `0 >= maxPending` — false — and ErrQueueFull could never be
+// returned. The queue appeared bounded while being unbounded in practice.
+func (s *RestoreSemaphore) AcquireRestoreSlot(ctx context.Context) error {
     select {
-    case w.restoreSem <- struct{}{}: // non-blocking fast path: slot free
-        metrics.RestoreQueueDepth.Set(float64(len(w.restoreQueue)))
+    case s.restoreSem <- struct{}{}: // fast path: a slot was free
         return nil
     default:
     }
-    // Semaphore full — try the pending queue
-    if len(w.restoreQueue) >= w.maxPendingRestores {
-        metrics.RestoreQueueFullTotal.Inc()
+
+    // Slots are full. Reserve a place in the waiting room before blocking, so the
+    // bound is enforced on waiters rather than only on holders.
+    if int(s.pending.Add(1)) > s.maxPendingRestores {
+        s.pending.Add(-1)
+        metrics.RecordQueueFull()
         return ErrQueueFull
     }
-    // Block until a slot is available or ctx expires
+    defer s.pending.Add(-1)
+    metrics.SetRestorationQueueDepth(float64(s.pending.Load()))
+
     select {
-    case w.restoreSem <- struct{}{}:
+    case s.restoreSem <- struct{}{}:
         return nil
     case <-ctx.Done():
+        // The caller gave up (request cancelled, or the 60s wake timeout fired).
         return ctx.Err()
     }
 }
 
-// ReleaseRestoreSlot is deferred by the gateway after each restore attempt.
-func (w *Worker) ReleaseRestoreSlot() {
-    <-w.restoreSem
-    metrics.RestoreQueueDepth.Set(float64(len(w.restoreQueue)))
+// ReleaseRestoreSlot is deferred inside the wake-owner callback.
+//
+// It must be called exactly once per successful Acquire. Calling it after a
+// failed Acquire would drain a slot this caller never held, permanently
+// shrinking the effective concurrency limit.
+func (s *RestoreSemaphore) ReleaseRestoreSlot() {
+    <-s.restoreSem
+    metrics.SetRestorationQueueDepth(float64(s.pending.Load()))
 }
 
-var ErrQueueFull = fmt.Errorf("restoration queue full; retry later")
+var ErrQueueFull = errors.New("restoration queue full; retry later")
 ```
 
-The gateway's `wakeAndForward` calls `AcquireRestoreSlot` before entering the `WakeLock.Wake` block and `ReleaseRestoreSlot` in a `defer` after the wake completes. When `ErrQueueFull` is returned, the gateway responds with `429 Too Many Requests` and `Retry-After: 10`.
+The restore slot is acquired **inside** the `WakeLock.Wake` owner callback, never before it. Deduplication must happen first: if 20 callers arrive at one hibernated environment and each acquires a slot before deduplicating, they consume the entire restore budget and the queue reports itself full against a single environment. With the correct order exactly one caller — the wake owner — takes a slot, and the other 19 wait on its channel without consuming anything. `ReleaseRestoreSlot` is deferred inside the same callback. When `ErrQueueFull` is returned the gateway responds `429 Too Many Requests` with `Retry-After: 10`.
 
 ---
 
@@ -1575,11 +3450,20 @@ gateway:
   image:
     repository: host.minikube.internal:5000/forge-gateway
     tag: latest
+  # MUST stay 1. The wake lock and restoration semaphore are process-local, so two
+  # replicas would each enforce their own limit — permitting 2 ×
+  # maxConcurrentRestorations and allowing duplicate restores of one environment.
+  # The chart template fails rendering if this is set to anything else.
+  replicas: 1
   port: 8080
   wakeTimeoutSeconds: 60
-  gracePeriodMinutes: 5
   maxConcurrentRestorations: 3
   maxPendingRestorations: 5
+  # gracePeriodMinutes is deliberately NOT exposed here. The post-restore grace
+  # period is a compile-time constant (v1alpha1.GracePeriod = 2m) because it is
+  # coupled to the `low` priority warm threshold (5m) — a configurable value
+  # larger than that threshold silently disables hibernation for low-priority
+  # environments. Shipping a Helm key that nothing reads is worse than no key.
 
 api:
   image:
@@ -1674,17 +3558,27 @@ trivy-scan:
 	# pipeline before the Forge operator deploys them. Use the same threshold.
 	# trivy image --exit-code 1 --severity HIGH,CRITICAL <app-image>:$(APP_SHA)
 
-# Push to local registry
+# Push to Docker Hub (rubric requirement) — credentials read from Vault
+docker-push-hub:
+	@vault read -field=username secret/forge/dockerhub > /dev/null # fail fast if Vault is sealed
+	docker push $(DOCKERHUB_USER)/forge-operator:$(GIT_SHA)
+	docker push $(DOCKERHUB_USER)/forge-gateway:$(GIT_SHA)
+	docker push $(DOCKERHUB_USER)/forge-api:$(GIT_SHA)
+	docker push $(DOCKERHUB_USER)/forge-webhook:$(GIT_SHA)
+
+# Push to local registry (Minikube's pull source)
+# All FOUR images. Omitting forge-webhook here while `deploy` sets
+# webhook.image.tag=$(GIT_SHA) leaves the webhook Deployment in ImagePullBackOff
+# on every release.
 docker-push:
 	docker push host.minikube.internal:5000/forge-operator:$(GIT_SHA)
 	docker push host.minikube.internal:5000/forge-gateway:$(GIT_SHA)
 	docker push host.minikube.internal:5000/forge-api:$(GIT_SHA)
+	docker push host.minikube.internal:5000/forge-webhook:$(GIT_SHA)
 
-# Apply CRDs manually (not handled by helm upgrade)
-apply-crds:
-	kubectl apply -f config/crd/
-
-# Apply CRDs before helm upgrade (helm upgrade does NOT upgrade CRDs in crds/)
+# Apply CRDs before helm upgrade — `helm upgrade` does NOT upgrade CRDs placed in
+# charts/forge/crds/. Defined ONCE: a duplicate target makes GNU Make warn and
+# silently discard the first recipe.
 apply-crds:
 	kubectl apply -f config/crd/
 
@@ -1705,6 +3599,231 @@ deploy: apply-crds
 smoke-test:
 	./hack/smoke-test.sh
 ```
+
+---
+
+## 13. Metrics Registry
+
+Every metric in HLD §8 has exactly one emitter here. This file is the single source of truth: if a metric is in the HLD table but not in this list, it is not implemented.
+
+**Cardinality rule, enforced by review:** no label may ever carry an environment name, PR number, repository, or user. Those produce one time series per PR and degrade Prometheus permanently (series are retained after the PR closes). Every label below has a fixed, small domain.
+
+```go
+// pkg/metrics/metrics.go
+package metrics
+
+// --- Gauges: set from a full CRD list, never incremented inside reconcile ---
+// Reconcile runs many times per state change, so incrementing there drifts.
+func SetEnvironmentsByState(state string, n float64)   // forge_environments{state}
+func SetActivePods(n float64)                          // forge_active_pods
+func SetEnvironmentsReady(n float64)                   // forge_environment_ready
+func SetCPURequestsSaved(millicores float64)            // forge_cpu_requests_saved_millicores
+func SetMemoryRequestsSaved(bytes float64)              // forge_memory_requests_saved_bytes
+func SetRestorationQueueDepth(n float64)                // forge_restoration_queue_depth
+func SetEnvironmentsStale(policy string, n float64)     // forge_environments_stale{policy}
+
+// --- Counters: incremented ONLY on an actual state transition ---
+func RecordProvisioningFailure(reason string)  // forge_provisioning_failures_total{reason}
+                                               // reason: timeout|image_pull|quota|other
+func RecordRestorationFailure(reason string)   // forge_restoration_failures_total{reason}
+func RecordHibernation(hibType string)         // forge_hibernations_total{type} type: warm|deep
+func RecordTermination(reason string)          // forge_terminations_total{reason}
+                                               // reason: ttl|pr_closed|manual
+func RecordEviction(evictedPriority string)    // forge_environment_evictions_total{evicted_priority}
+func RecordQueueFull()                         // forge_restoration_queue_full_total
+func RecordDriftRebuild()                      // forge_drift_rebuilds_total
+
+// --- Predictive wake: TWO metrics, not one ---
+// Split because one wake would otherwise increment the same counter three times
+// (decision in the webhook, restore in the reconciler, outcome in the lifecycle
+// manager), making the total meaningless.
+//
+// Emitted once per signal, by the webhook receiver only:
+func RecordWakeDecision(decision string)  // forge_predictive_wake_decisions_total{decision}
+    // decision: triggered|skipped_bot|no_environment|disabled|expired|
+    //           already_up|ineligible|no_capacity|conflict
+//
+// Emitted once per TRIGGERED wake, by the lifecycle manager only, when the
+// outcome is finally known:
+func RecordPredictiveWake(result string)  // forge_predictive_wakeups_total{result}
+    // result: hit|miss
+// Prediction accuracy = hit / (hit + miss). Decisions are not part of that ratio.
+
+// --- Gateway request-path metrics ---
+func RecordGatewayRequest(outcome string)      // forge_gateway_requests_total{outcome}
+    // outcome: forwarded|woken|queued_full|not_found|gone|blocked_stale|failed
+    // NOT per-environment — outcome only.
+func RecordUpstreamError(kind string)          // forge_gateway_upstream_errors_total{kind}
+    // kind: dial_failed|timeout|bad_gateway
+func RecordRestoreQueueWait(d time.Duration)   // forge_restoration_queue_wait_seconds
+    // Time spent waiting for a slot, excluding the restore itself. Separates
+    // "slow to restore" from "waited behind other restores".
+
+// --- Operator housekeeping ---
+func SetOrphanedResources(n float64)           // forge_orphaned_resources
+    // Namespaces labelled forge.dev/environment with no matching CRD. Should be 0;
+    // a non-zero value means finalizer cleanup is failing.
+func RecordImagePullDuration(cacheState string, d time.Duration)
+    // forge_image_pull_duration_seconds{cache_state}
+    // cache_state: node_cached|registry_pull|remote_pull
+    // Derived from Pod events, not measured directly by Forge.
+
+// --- Histograms ---
+func RecordProvisioningDuration(result string, d time.Duration)
+    // forge_provisioning_duration_seconds{result} result: success|timeout
+func RecordRestoration(from, result string, d time.Duration)
+    // forge_restoration_duration_seconds{from,result}
+    // from: warm|deep   result: success|timeout
+    // Measured from Status.RestorationStartedAt, never from RestoredAt.
+```
+
+**Wiring status.** Declaring a metric is not emitting it. These are wired at their real transition points in the code above:
+
+| Metric | Call site |
+|---|---|
+| `forge_hibernations_total` | both hibernation handlers |
+| `forge_restoration_duration_seconds` | restoration handler, on the transition to ACTIVE |
+| `forge_provisioning_duration_seconds` | provisioning handler, guarded against requeue double-count |
+| `forge_provisioning_failures_total` / `forge_restoration_failures_total` | `setFailure`, guarded by a state-unchanged check |
+| `forge_terminations_total` | terminating handler, after the namespace is confirmed gone |
+| `forge_environment_evictions_total` | `evictLRUByPriority` |
+| `forge_predictive_wake_decisions_total` | `predictiveWake`, every return path |
+| `forge_predictive_wakeups_total` | lifecycle manager, hit/miss |
+| `forge_restoration_queue_depth` / `_full_total` | `RestoreSemaphore` |
+| `forge_drift_rebuilds_total` | `maybeAutoRebuild` |
+
+The remaining gauges and the gateway request-path counters (`forge_environments`, `forge_active_pods`, `forge_environment_ready`, `forge_cpu_requests_saved_millicores`, `forge_memory_requests_saved_bytes`, `forge_environments_stale`, `forge_orphaned_resources`, `forge_gateway_requests_total`, `forge_gateway_upstream_errors_total`, `forge_restoration_queue_wait_seconds`, `forge_image_pull_duration_seconds`) are **registered in Phase 1 and wired in Phase 4** alongside the Grafana dashboards. They are all derived from a single list the lifecycle manager already performs, or from a counter increment on an existing gateway code path, so wiring them is additive and changes no schema.
+
+**Who emits what, and from where:**
+
+| Component | Emits |
+|---|---|
+| Operator reconciler | provisioning/restoration durations and failures, hibernations, terminations |
+| Lifecycle manager (60s tick) | all gauges — it already lists every Environment, so gauges are a by-product of a list it was doing anyway; plus predictive hit/miss |
+| Capacity worker | evictions |
+| Gateway | queue depth, queue-full |
+| Webhook receiver | wake decisions, drift rebuilds |
+
+Gauges are set by the lifecycle manager rather than the reconciler because the reconciler only ever sees one Environment at a time and cannot compute a cluster-wide count without an extra list per reconcile.
+
+---
+
+## 14. Shared Helpers
+
+Small functions referenced throughout this document. Listed so no handler depends on an undefined helper at implementation time.
+
+```go
+// pkg/util — parsing and naming
+
+// parseDuration wraps time.ParseDuration and returns the zero value on error.
+// Every duration field is pattern-validated by the CRD, so a parse failure means
+// the CEL validation was bypassed; returning 0 makes the caller skip the policy
+// rather than panic. Note: Go does not accept "d" — TTL uses hours ("72h").
+func parseDuration(s string) time.Duration
+
+// sanitizeRepoName lowercases, replaces every character outside [a-z0-9-] with
+// "-", collapses runs of "-", trims leading/trailing "-", and truncates so that
+// the final "{repo}-pr-{number}" fits inside Kubernetes' 63-character name limit.
+// Truncation reserves len("-pr-") + len(maxPRDigits) characters.
+func sanitizeRepoName(raw string) string
+```
+
+The three status writers (`setStatus`, `setStatusMessageOnly`, `setFailure`) and
+`classifyFailure` are defined in §3 under "Status helper". Each carries an
+equality guard so that a requeue into an unchanged state writes nothing — without
+it the write fires a watch event, which re-reconciles, which writes again.
+
+```go
+// pkg/webhook — drift helpers
+
+// GetLastRebuildAt is defined on *DriftStatus with a nil-receiver guard, because
+// it is called as env.Status.Drift.GetLastRebuildAt() on the first drift check,
+// when Status.Drift is still nil.
+func (d *DriftStatus) GetLastRebuildAt() *metav1.Time {
+    if d == nil {
+        return nil
+    }
+    return d.LastRebuildAt
+}
+
+// patchDrift writes a fresh DriftStatus, preserving LastRebuildAt.
+func (h *WebhookHandler) patchDrift(ctx context.Context, env *v1alpha1.Environment, cmp *GitHubCompare) error
+
+// patchDriftError records LastCheckError and LastCheckedAt without touching the
+// commit numbers, so stale-but-known data is preserved and visibly dated.
+func (h *WebhookHandler) patchDriftError(ctx context.Context, env *v1alpha1.Environment, cause error) error
+```
+
+```go
+// pkg/github — the only three GitHub API calls Forge makes
+
+type GitHubCompare struct {
+    MergeBaseSHA string
+    BaseHeadSHA  string
+    BehindBy     int
+    MergeBaseAt  *metav1.Time
+}
+
+// CompareCommits calls GET /repos/{repo}/compare/{base}...{head}.
+// Caches an ETag per (repo, base, head); an unchanged comparison returns 304,
+// which does not count against the 5000 req/h authenticated rate limit.
+func (c *Client) CompareCommits(ctx context.Context, repo, base, head string) (*GitHubCompare, error)
+
+```
+
+```go
+// pkg/webhook — CI trigger
+//
+// An interface, not a concrete Jenkins client, because drift auto-rebuild is the
+// only caller and the demo may use either Jenkins or a GitHub workflow_dispatch.
+// Swapping one for the other must not touch the drift logic.
+type CITrigger interface {
+    // TriggerRebuild asks CI to rebuild a PR's image. Used only by drift
+    // auto-rebuild; ordinary rebuilds arrive as `synchronize` webhooks and need
+    // no outbound call at all.
+    TriggerRebuild(ctx context.Context, repo string, pr int) error
+}
+
+// JenkinsTrigger posts to Jenkins' build-with-parameters endpoint using a token
+// read from Vault. A no-op implementation is used in tests so drift tests do not
+// need a reachable CI system.
+type JenkinsTrigger struct {
+    baseURL string
+    job     string
+    token   string
+}
+```
+
+```go
+// pkg/capacity — the gateway/operator split
+//
+// These are deliberately SEPARATE interfaces implemented by separate types. The
+// gateway and operator are different binaries and cannot share in-memory state;
+// giving the gateway the full Worker type invites wiring cross-process counters
+// that silently read zero.
+
+// Admitter lives in the OPERATOR only. Serialised through one goroutine so two
+// concurrent admissions cannot both observe "9 active" and both be admitted.
+type Admitter interface {
+    Admit(ctx context.Context, envName, priority string) error
+    HasFreeSlot(ctx context.Context) (bool, error) // advisory; used by predictive wake
+    // Release frees a slot. Called by the reconciler on every transition OUT of
+    // ACTIVE. Without a caller, drainQueue never runs and a freed slot is never
+    // handed to a queued environment.
+    Release(envName string)
+}
+
+// RestoreLimiter lives in the GATEWAY only. In-memory semaphore, which is why
+// the gateway is pinned to a single replica.
+type RestoreLimiter interface {
+    AcquireRestoreSlot(ctx context.Context) error // returns ErrQueueFull
+    ReleaseRestoreSlot()
+}
+
+var ErrQueueFull = errors.New("restoration queue full")
+```
+
+**Gateway replica constraint.** `RestoreLimiter` holds its semaphore in memory, so `maxConcurrentRestorations` is enforced per replica. Two gateway replicas would enforce 6, not 3. The Helm chart therefore pins `gateway.replicas: 1` and the chart rejects any other value. HPA belongs on the webhook receiver or the API server, both of which are stateless — never on the gateway.
 
 ---
 

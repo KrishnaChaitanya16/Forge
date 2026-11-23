@@ -28,7 +28,7 @@ etcd storage is almost irrelevant by comparison — the entire etcd database for
 ```
 Kubernetes objects in etcd:
   ✓ Environment CRD              ~5KB
-  ✓ Namespace (forge-pr-101)     ~2KB
+  ✓ Namespace (forge-payments-pr-101)     ~2KB
   ✓ Deployment                   ~4KB
   ✓ ReplicaSet                   ~3KB
   ✓ Pod                          ~4KB
@@ -54,7 +54,7 @@ Running processes:
 ```
 Kubernetes objects in etcd:
   ✓ Environment CRD              ~5KB
-  ✓ Namespace (forge-pr-101)     ~2KB
+  ✓ Namespace (forge-payments-pr-101)     ~2KB
   ✓ Deployment  (replicas=0)     ~4KB   ← still exists, just 0 replicas
   ✓ ReplicaSet  (desired=0)      ~3KB
   ✗ Pod                          GONE   ← deleted
@@ -80,7 +80,7 @@ Running processes:
 ```
 Kubernetes objects in etcd:
   ✓ Environment CRD              ~5KB   ← full spec retained here
-  ✓ Namespace (forge-pr-101)     ~2KB
+  ✓ Namespace (forge-payments-pr-101)     ~2KB
   ✗ Deployment                   GONE
   ✗ ReplicaSet                   GONE
   ✗ Pod                          GONE

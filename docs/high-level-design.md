@@ -1,6 +1,6 @@
 # Forge — High-Level Design
 
-> Living document · Last updated: 2026-11-02
+> Living document · Last updated: 2026-11-23
 > Update this file as design decisions change. Add a note under the relevant section with the date and what changed.
 
 ---
@@ -44,6 +44,8 @@ As AI-assisted development accelerates code output, teams open more PRs and crea
 | Warm hibernation | Scales Pods to zero after 15 min idle; keeps routing alive |
 | Deep hibernation | Removes Deployment + Service after 2h idle; retains metadata |
 | Traffic-triggered wake | Incoming request to hibernated URL triggers automatic restore |
+| Predictive wake-up | Restores environment before reviewer arrives, using GitHub events (review assigned, CI passed) as intent signals |
+| Drift detection | Detects when a PR environment is stale because the base branch has moved ahead; warns, auto-rebuilds, or blocks |
 | Auto-termination | Cleans up all resources when PR closes or TTL expires |
 | Image scanning | Trivy scans every image for CVEs before deployment |
 
@@ -99,6 +101,10 @@ Forge is also the SPE capstone project. The platform itself is delivered through
 | PR opened | Create environment |
 | PR synchronize (new commit) | Update image tag, redeploy |
 | PR closed / merged | Terminate environment |
+| PR `review_requested` | **Predictive wake-up** — restore environment before reviewer arrives |
+| PR `check_suite` completed (success) | **Predictive wake-up** — CI passed, reviewer likely coming |
+| PR `issue_comment` / `pull_request_review` | **Predictive wake-up** — activity on PR, restore if hibernated |
+| PR `push` to base branch (not PR branch) | **Drift detection** — check if environment's base has moved |
 
 ### 3.2 Environment API
 
@@ -146,7 +152,7 @@ POST   /api/v1/environments/:name/pin   Protect from hibernation
 - Uses HTTP request timestamps recorded by the Gateway as the inactivity signal
 - Periodic reconciliation loop (every 60s) checks all active environments against their policies
 - TTL check is hard: expired environments terminate regardless of pin status
-- **Restore grace period:** when an environment is restored, `lastActivityAt` is reset to `now()` and a minimum 5-minute "stay awake" window is enforced. Without this, the 60s inactivity loop would re-hibernate immediately because `lastActivityAt` still held the pre-hibernation value.
+- **Restore grace period:** when an environment is restored, `lastActivityAt` is reset to `now()` and a minimum 2-minute "stay awake" window is enforced. It is deliberately shorter than the smallest warm-hibernate threshold (`low` = 5m); a 5-minute grace period would exactly cancel that threshold and a restored low-priority environment could never hibernate on its first idle window. Without this, the 60s inactivity loop would re-hibernate immediately because `lastActivityAt` still held the pre-hibernation value.
 
 **Inactivity policy (configurable per environment):**
 
@@ -155,7 +161,7 @@ Last HTTP request > 15 min ago  →  Warm hibernation  (unless in grace period)
 Last HTTP request > 2h ago      →  Deep hibernation   (unless in grace period)
 PR closed OR TTL expired        →  Termination        (overrides grace period)
 Manually pinned                 →  Skip inactivity check
-Restored < 5 min ago            →  Grace period: skip inactivity check
+Restored < 2 min ago            →  Grace period: skip inactivity check
 ```
 
 ### Adaptive hibernation policy
@@ -193,7 +199,89 @@ Priority is set per environment via `spec.lifecycle.priority`. The default is `n
 
 > Diagram: [docs/diagrams/gateway-request-flow.md](diagrams/gateway-request-flow.md)
 
-### 3.6 Resource Manager
+### 3.6 Predictive Wake-Up
+
+**Responsibility:** Restore hibernated environments proactively — before the reviewer arrives — using GitHub events as intent signals.
+
+**The problem with reactive restoration:** Every existing tool (Okteto, vCluster, Northflank) triggers restoration only when an HTTP request hits a sleeping environment. The reviewer always waits. Okteto's own documentation reports 1–2 minute wake times.
+
+**Forge's approach:** The webhook receiver already processes GitHub events. Certain events predict "someone is about to visit this environment." When Forge sees one, it pre-warms the environment immediately.
+
+**Intent signals and actions:**
+
+| GitHub Event | Why it predicts a visit | Forge action |
+|---|---|---|
+| `review_requested` | Reviewer assigned → they will click the preview link | Restore to ACTIVE |
+| `check_suite` completed (success) | CI passed → PR is ready for review → reviewer likely to visit | Restore to ACTIVE |
+| `pull_request_review` (comment/approve) | Someone is actively reviewing → will check the preview | Restore to ACTIVE if HIBERNATING |
+| `issue_comment` on the PR | Discussion happening → participants looking at the PR | Restore to ACTIVE if DEEP_HIBERNATING only |
+
+**Design choices:**
+- Predictive restore uses the same restoration pipeline as reactive restore (bounded queue, wake-lock deduplication, operator reconcile)
+- If the environment is already ACTIVE, the signal is a no-op
+- If the bounded restoration queue is full, predictive restores are **dropped silently** (not 429'd — the caller hasn't arrived yet, so there's nobody to notify)
+- Predictive restores count against the same `maxConcurrentRestorations` limit — they do not get a separate budget
+- A predictive restore holds the environment for `predictiveWakeTTL` (default **10 minutes**), not the normal 15-minute inactivity window. A speculative wake must not hold a capacity slot as long as real traffic does. This check runs before the 2-minute post-restore grace period, which would otherwise mask the shorter TTL
+- CRD status records `restorationTrigger: predictive | reactive` so metrics can distinguish between the two
+
+**What this enables:** When a reviewer is assigned to a PR, the environment is already running by the time they click the preview link. Effective wake time from the reviewer's perspective: **zero seconds.**
+
+**Metrics:** two separate counters, so one wake cannot inflate the same series more than once.
+
+- `forge_predictive_wake_decisions_total{decision}` — emitted by the webhook receiver for every intent signal, recording what was done with it (`triggered`, `skipped_bot`, `no_environment`, `no_capacity`, `already_up`, …).
+- `forge_predictive_wakeups_total{result=hit|miss}` — emitted once by the lifecycle manager for each *triggered* wake, when the outcome is known. A "hit" means a real request arrived within `predictiveWakeTTL` (default 10 minutes); a "miss" means nobody came and the environment re-hibernated. Prediction accuracy is `hit / (hit + miss)`.
+
+---
+
+### 3.7 Environment Drift Detection
+
+**Responsibility:** Detect when a preview environment is running stale code because the base branch (`main`) has moved ahead since the environment was last built.
+
+**The problem:** A PR environment was provisioned 3 days ago from `main` at commit `abc123`. Since then, 20 commits have landed on `main`. The reviewer visits the preview and sees code that doesn't reflect current `main`. They may approve a PR whose preview doesn't match what will actually be merged.
+
+No existing preview environment tool detects this.
+
+**How Forge detects drift:**
+
+The webhook receiver already handles `push` events. When a push lands on the base branch of any open PR:
+
+1. Forge compares the current `main` HEAD with the `branchPoint` stored in each Environment's CRD status
+2. Computes `commitsBehind` — how far the environment's base has diverged
+3. If `commitsBehind > driftThreshold` (default: 10 commits), the environment is marked as STALE
+
+**CRD status fields:**
+
+```yaml
+status:
+  drift:
+    baseBranch: main
+    branchPoint: abc123           # commit where PR branched from main
+    currentBaseHead: xyz789       # current HEAD of main
+    commitsBehind: 20
+    stale: true
+    lastCheckedAt: "2026-12-05T14:30:00Z"
+```
+
+**Three response modes (configured via `spec.drift.policy`):**
+
+| Mode | Behaviour |
+|---|---|
+| `warn` (default) | Gateway injects a banner into proxied responses: "This preview is 20 commits behind main" |
+| `auto-rebuild` | Forge triggers a new build via the webhook→API pipeline with the latest base, same PR branch |
+| `block` | Environment paused — returns a page saying "Environment stale, waiting for rebase" until developer rebases |
+
+**Design choices:**
+- Drift check runs only when a push to the base branch is received — not on a timer, to avoid polling GitHub
+- `branchPoint` is recorded at provisioning time by querying the GitHub API for the merge base
+- `auto-rebuild` mode calls the same `synchronize` path that handles new PR commits — it triggers image rebuild and rolling deploy
+- The `warn` banner is injected by the gateway's reverse proxy as an HTML snippet prepended to `text/html` responses — API (JSON) responses are not modified
+- Drift detection is free — it uses events Forge already receives, adds no new external API calls except the initial merge-base query at provisioning
+
+**Metric:** `forge_environments_stale` (Gauge) — count of environments currently in stale state, labelled by `policy` (warn/auto-rebuild/block).
+
+---
+
+### 3.8 Resource Manager
 
 **Responsibility:** Enforces per-environment and global resource limits.
 
@@ -293,7 +381,30 @@ For stateful environments with a PersistentVolume: the PV is retained through bo
 
 **Estimated total (cached image): 3–7 seconds**
 
-The difference between warm and deep restoration latency is small (~2s). The dominant variable in both cases is **image cache hit vs miss**, not storage retrieval.
+### What actually dominates wake latency
+
+These numbers are design targets, not measurements — nothing has been benchmarked yet, and the final demo must publish measured figures rather than these estimates. But the *shape* of the breakdown matters more than the absolute values, and it is not what the obvious intuition suggests:
+
+| Phase | Time | Can Forge influence it? |
+|---|---|---|
+| API call to patch replicas | ~50ms | No — already negligible |
+| kube-scheduler decision | ~200–500ms | No |
+| containerd container start | ~200–500ms | No |
+| Image pull, layers cached | ~0s | Already free via containerd layer cache |
+| Image pull, unique layer only | ~1–3s | Marginally, via the local registry |
+| App process initialisation | ~200ms–3s | No — property of the application |
+| **Readiness probe grace period** | **1s to 30s** | **Yes — Forge sets it** |
+
+**The readiness probe is the dominant and the only controllable term.** Kubernetes' defaults (`initialDelaySeconds: 0`, `periodSeconds: 10`) mark a Pod Ready up to 10 seconds after it is actually serving: the first probe fires before the process has bound its port, and the next waits a full period. A conservatively-configured app with `initialDelaySeconds: 30` is Ready no sooner than 30 seconds no matter how fast it starts.
+
+Because Forge creates the Deployment, it owns that configuration and sets `1s/1s` with a `failureThreshold` of 30. This is the single largest lever Forge has over wake time, and it is unavailable to any approach where the user's own manifest defines the probe.
+
+**Two claims that do not hold up, stated plainly:**
+
+- **Warm is not meaningfully faster than deep.** With the image cached, deep hibernation adds only the Deployment→ReplicaSet creation round trip — roughly 100ms. The real reasons for two levels are that warm *guarantees* the image stays on the node (the Deployment still references it, so kubelet GC cannot evict it) and that deep removes objects from kube-controller-manager's watch set at scale. Neither is a latency argument.
+- **The local registry is infrastructure hygiene, not a breakthrough.** containerd already caches shared base layers, so only the unique application layer (~8MB for a Go binary on Alpine) is pulled per PR. The registry saves 1–3 seconds and removes the Docker Hub rate limit and the offline dependency. It does not save 60 seconds except in the cold-start case where no layer of the image has ever been pulled.
+
+The honest comparison target is not "Forge vs always-on" but **"Forge vs delete-and-redeploy"**, where the gap comes from skipping object recreation and from probe tuning, not from image handling.
 
 ### Image caching strategy (most important latency lever)
 
@@ -578,6 +689,10 @@ All images are scanned in CI before deployment. HIGH and CRITICAL CVEs block the
 | `forge_memory_requests_saved_bytes` | Gauge | — | Same approach for memory. |
 | `forge_restoration_queue_depth` | Gauge | — | Pending restoration requests. |
 | `forge_restoration_queue_full_total` | Counter | — | 429s returned due to full queue. |
+| `forge_predictive_wake_decisions_total` | Counter | `decision` | Every intent signal and what was done with it: `triggered`, `skipped_bot`, `no_environment`, `disabled`, `expired`, `already_up`, `ineligible`, `no_capacity`, `conflict`. Emitted by the webhook receiver only. |
+| `forge_predictive_wakeups_total` | Counter | `result` (hit/miss) | Outcome of a *triggered* wake, emitted once by the lifecycle manager. "hit" = a real request arrived within `predictiveWakeTTL`; "miss" = nobody came and it re-hibernated. Accuracy = hit / (hit + miss). Kept separate from the decisions counter so one wake cannot increment the same metric three times. |
+| `forge_environments_stale` | Gauge | `policy` (warn/auto-rebuild/block) | Count of environments currently in stale (drifted) state. |
+| `forge_drift_rebuilds_total` | Counter | — | Auto-rebuilds triggered by drift detection. |
 | `forge_restoration_queue_wait_seconds` | Histogram | — | Time waiting for a restoration slot. |
 | `forge_image_pull_duration_seconds` | Histogram | `result` | Time for image pull during restoration. |
 | `forge_gateway_requests_total` | Counter | `state` (active/hibernated/unknown) | All inbound gateway requests. |
@@ -731,8 +846,10 @@ Envtest binaries are downloaded via `setup-envtest` from `sigs.k8s.io/controller
 | 1 | Core control plane: API, CRD, operator, webhook, provisioning, state machine, TTL termination | Must |
 | 2 | Resource-efficient lifecycle: warm hibernation, deep hibernation, image reuse, restoration, finalizer cleanup | Must |
 | 3 | Traffic-aware gateway: routing, hibernation detection, wake-up, deduplication, timeouts | Must |
-| 4 | Governance + observability: ResourceQuota, capacity limits, Prometheus metrics, Grafana dashboards | Must |
-| SPE | CI/CD pipeline: Jenkins, Docker, Trivy, Helm, Ansible, Minikube deploy | Must |
+| 4 | Governance + observability: ResourceQuota, capacity limits, Prometheus metrics, Grafana dashboards, ELK logging | Must |
+| 5 | Predictive wake-up: webhook intent signals → proactive restoration before reviewer arrives | Must |
+| 6 | Drift detection: base branch divergence tracking, stale environment warning/auto-rebuild | Must |
+| SPE | CI/CD pipeline: Jenkins, Docker, Docker Compose, Trivy, Helm, Ansible, Vault, Minikube deploy | Must |
 
 ### Milestones
 
@@ -763,8 +880,10 @@ If time runs short, cut in this order (later = cut first):
 
 1. Keep: full Phase 1 + Phase 2 + SPE pipeline
 2. Keep if possible: Phase 3 gateway (basic routing + wake-up without deduplication)
-3. Cut if needed: concurrent wake-up deduplication (replace with simple sequential approach)
-4. Cut entirely: snapshot-based data restoration, predictive pre-warming, request buffering, CRIU
+3. Keep if possible: Phase 5 predictive wake-up (high demo impact, low code effort)
+4. Cut if needed: Phase 6 drift detection `auto-rebuild` mode (keep `warn` mode — it's simpler)
+5. Cut if needed: concurrent wake-up deduplication (replace with simple sequential approach)
+6. Cut entirely: snapshot-based data restoration, request buffering, CRIU
 
 ---
 
@@ -783,12 +902,13 @@ If time runs short, cut in this order (later = cut first):
 ### Future Extensions (out of scope for Dec demo)
 
 - **Snapshot-based restoration:** Database snapshots before deep hibernation; restore from snapshot on wake
-- **Predictive pre-warming:** Analyse PR activity patterns and pre-warm environments before they're accessed
 - **Request buffering:** Buffer incoming requests during restoration instead of holding connections open
 - **gVisor/Kata isolation:** Stronger sandboxing for environments running untrusted branch code
 - **Multi-cluster management:** Spread environments across multiple clusters for capacity
 - **CRIU process checkpointing:** Save and restore running process memory (very advanced, not needed for stateless apps)
-- **Cost attribution:** Track per-developer resource consumption and report it
+- **Git-signal dynamic priority:** Automatically compute eviction priority from PR activity (review threads, CI status, approvals, age) instead of manual labels
+- **Active hours scheduling:** `spec.activeHours` field to force hibernation outside configured working hours (e.g. 9am–6pm)
+- **Per-PR cost attribution:** Track accumulated active core-seconds per environment, expose as `kubectl get env` column and Prometheus metric
 
 ---
 
