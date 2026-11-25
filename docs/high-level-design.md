@@ -455,6 +455,18 @@ This pipeline serves two purposes: (1) building and deploying Forge itself, and 
 
 **Jenkins vs GitHub Actions:** Jenkins runs locally on the same machine as Minikube — no external service dependency, satisfies the "laptop-runnable" constraint. GitHub Actions is an acceptable alternative if Jenkins setup is time-consuming.
 
+**Build trigger — GitHub hook trigger for GITScm polling:** the Jenkins job uses the **GitHub hook trigger for GITScm polling** (`githubPush()` in the declarative `triggers` block), not a timer-based `pollSCM` schedule. GitHub sends a `push` webhook to `/github-webhook/` on the Jenkins controller; Jenkins then polls the SCM once to confirm what changed and starts the build. This means a build starts within seconds of a push rather than at the next polling interval, and no build runs when nothing changed.
+
+```groovy
+pipeline {
+  agent any
+  triggers { githubPush() }   // GitHub hook trigger for GITScm polling
+  ...
+}
+```
+
+Because Jenkins runs locally, GitHub cannot reach it directly. For the demo the controller is exposed through an `ngrok` tunnel (or the webhook is replaced with a manual `Build Now` as a fallback if the tunnel is unavailable during the viva).
+
 **Local registry:** `docker run -d -p 5000:5000 registry:2` — avoids DockerHub rate limits and works fully offline. Minikube is configured to trust this registry.
 
 **Trivy in CI:** `trivy image --exit-code 1 --severity HIGH,CRITICAL` fails the build on high/critical CVEs. This is intentionally strict for the demo — shows the pipeline actively enforcing security. For the actual demo, use a clean Alpine-based image that passes the scan.
@@ -659,6 +671,65 @@ default:
 - New environments queue if at capacity; eligible idle ones are hibernated first (lowest priority, LRU)
 - Maximum 3 concurrent restorations (configurable)
 - Maximum 5 pending restoration requests before 429 is returned
+
+### Horizontal Pod Autoscaling
+
+Forge uses HPA in two places. Which component gets one is a deliberate decision, not a default — most of Forge must **not** be autoscaled.
+
+| Component | HPA? | Why |
+|---|---|---|
+| **Webhook receiver** | ✅ `autoscaling/v2`, 1–5 replicas, 60% CPU | Stateless, and genuinely bursty: a merge train or a batch of PRs opening produces a spike of concurrent deliveries. GitHub times a webhook out after 10 seconds, so dropped deliveries are real work lost |
+| **Managed application Pods** | ✅ optional per environment, 1–3 replicas, 70% CPU | The app under review is what receives variable load when a reviewer exercises a feature. This is the architecturally correct place for HPA — the workload, not the control plane |
+| Gateway | ❌ pinned to 1 | The wake lock and restoration semaphore are process-local. Two replicas would each enforce `maxConcurrentRestorations` independently and allow duplicate restores of the same environment |
+| Operator | ❌ leader-elected | Only one replica is ever active; a second sits idle waiting for the leader lease. Scaling it achieves nothing |
+| API server | ❌ | Stateless and safe to scale, but its traffic is low by nature — it is called only on PR events and manual commands |
+
+```yaml
+# config/hpa/webhook-hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: forge-webhook
+  namespace: forge-system
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: forge-webhook
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+```
+
+**HPA and hibernation interact, and Forge resolves the conflict explicitly.** When an environment hibernates, Forge sets its Deployments to `replicas: 0`. An HPA on that Deployment would observe zero replicas, compare against `minReplicas: 1`, and scale it straight back up — hibernation would last a few seconds and silently undo itself. Forge therefore **serialises the HPA spec into the CRD status and deletes the HPA before scaling down**, recreating it from that stored spec after the workloads are back. The ordering matters in both directions: delete the HPA *before* scaling to zero, and recreate it *after* the workloads exist, or the HPA controller backs off on a dangling `scaleTargetRef`.
+
+**On CPU as the scaling metric.** CPU is a lagging indicator for the gateway, where load is I/O-bound rather than compute-bound — the architecturally correct signal there would be `forge_active_environments` exposed through the Prometheus adapter, scaling one replica per N active environments. That is not implemented, because the gateway is single-replica by design for the reasons above. For the webhook receiver, CPU genuinely tracks the work (signature validation plus JSON parsing per delivery), so it is the right metric there.
+
+### Live Patching (Zero-Downtime Updates)
+
+Updating Forge itself, or an environment's application, never takes the preview URL offline.
+
+**Forge's own components** use Kubernetes `RollingUpdate` with `maxUnavailable: 0`, so a new Pod must pass its readiness probe before an old one is removed:
+
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+```
+
+The CI pipeline verifies this with `kubectl rollout status --timeout=120s` on all four components; a failed rollout leaves the previous release serving and fails the stage rather than leaving a half-deployed system.
+
+**Application updates (a new commit on a PR)** follow the same path. The `synchronize` webhook patches `spec.image.tag`, which bumps the CRD's `metadata.generation`. The operator's `reconcileActive` observes the generation change and routes back through provisioning, which is create-or-update — producing a rolling update of the existing Deployment rather than a delete-and-recreate. The reviewer refreshes the preview URL and sees the new code; the URL never 404s and the environment never leaves `ACTIVE`.
+
+**Configuration changes** (hibernation thresholds, drift policy, priority) are applied by patching the Environment CRD and take effect on the next reconcile — no restart of any Forge component is required.
 
 ### Image Scanning (Trivy)
 

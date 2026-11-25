@@ -98,6 +98,8 @@ forge/
 │   │   ├── operator_clusterrole.yaml
 │   │   ├── gateway_clusterrole.yaml
 │   │   └── webhook_clusterrole.yaml
+│   ├── hpa/
+│   │   └── webhook-hpa.yaml       autoscaling/v2, 1-5 replicas, 60% CPU
 │   └── samples/
 │       └── environment_sample.yaml
 │
